@@ -1,0 +1,45 @@
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 编译/缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 本地数据库（每人本地一份，不纳入版本库）
+*.db
+squat_gym.db
+
+# 视频与媒体（体积大、多为本地素材）
+videos/
+*.mov
+*.MOV
+*.mp4
+*.avi
+
+# 脚本生成的可视化报告（可本地重新生成）
+vbt_pro_coach_report.png
+velocity_loss_report.png
+
+# 模型权重（体积较大，多为二进制文件，不必纳入 Git 历史）
+models/
+*.tflite
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
+.env
+.env.local

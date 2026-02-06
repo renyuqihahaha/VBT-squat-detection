@@ -1,0 +1,7 @@
+# VBT 增强版分析系统依赖（vbt_analytics_pro.py）
+# tflite_runtime 与 NumPy 2.x 不兼容，必须使用 numpy<2
+numpy>=1.19.0,<2
+opencv-python>=4.5.0
+matplotlib>=3.3.0
+# 树莓派上建议: tflite_runtime>=2.5.0；其他环境可用: tensorflow>=2.5.0
+# 仅摄像头模式需要（树莓派）: picamera2
