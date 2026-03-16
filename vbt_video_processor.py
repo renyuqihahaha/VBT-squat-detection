@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import time
 import sqlite3
+from datetime import datetime
 from collections import deque
 
 from vbt_analytics_pro import (
@@ -27,7 +28,9 @@ from vbt_analytics_pro import (
     MODEL_PATH,
     CONF_THRESHOLD,
     init_db,
+    log_analysis_task,
 )
+from vbt_runtime_config import get_current_user_name
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -364,30 +367,56 @@ def main():
     output_details = interpreter.get_output_details()
 
     total_reps = 0
-    for video_path in video_files:
+    total_videos = len(video_files)
+    for idx, video_path in enumerate(video_files, start=1):
         filename = os.path.basename(video_path)
         if args.video:
             deleted = delete_batch_reps_by_filename(DB_PATH, filename)
             if deleted:
                 print(f"已删除该视频旧记录 {deleted} 条，重新分析并补充。")
-        print(f"处理: {filename}")
-        reps = process_video(video_path, interpreter, input_details, output_details, standard_seq)
-        for rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_sim, barbell_path_blob in reps:
-            insert_batch_rep(
+        print(f"正在分析第 {idx}/{total_videos} 个视频，请稍候... ({filename})")
+        start_at = time.time()
+        start_iso = datetime.now().isoformat()
+        try:
+            reps = process_video(video_path, interpreter, input_details, output_details, standard_seq)
+            for rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_sim, barbell_path_blob in reps:
+                insert_batch_rep(
+                    DB_PATH,
+                    filename=filename,
+                    rep_no=rep_no,
+                    v_mean=v_mean,
+                    min_knee_angle=min_knee_angle,
+                    max_trunk_angle=max_trunk_angle,
+                    dtw_similarity=dtw_sim,
+                    barbell_path_y=barbell_path_blob,
+                )
+                total_reps += 1
+                ka = f"{min_knee_angle:.1f}°" if min_knee_angle is not None else "—"
+                ta = f"{max_trunk_angle:.1f}°" if max_trunk_angle is not None else "—"
+                sim = f"{dtw_sim:.3f}" if dtw_sim is not None else "—"
+                print(f"  动作 {rep_no} | MCV={v_mean:.3f} m/s | 最小膝角={ka} | 躯干最大倾角={ta} | 相似度={sim}")
+            log_analysis_task(
                 DB_PATH,
-                filename=filename,
-                rep_no=rep_no,
-                v_mean=v_mean,
-                min_knee_angle=min_knee_angle,
-                max_trunk_angle=max_trunk_angle,
-                dtw_similarity=dtw_sim,
-                barbell_path_y=barbell_path_blob,
+                video_name=filename,
+                user_name=get_current_user_name(),
+                start_time=start_iso,
+                duration=time.time() - start_at,
+                reps_count=len(reps),
+                status="Success",
+                error_msg=None,
             )
-            total_reps += 1
-            ka = f"{min_knee_angle:.1f}°" if min_knee_angle is not None else "—"
-            ta = f"{max_trunk_angle:.1f}°" if max_trunk_angle is not None else "—"
-            sim = f"{dtw_sim:.3f}" if dtw_sim is not None else "—"
-            print(f"  动作 {rep_no} | MCV={v_mean:.3f} m/s | 最小膝角={ka} | 躯干最大倾角={ta} | 相似度={sim}")
+        except Exception as e:
+            log_analysis_task(
+                DB_PATH,
+                video_name=filename,
+                user_name=get_current_user_name(),
+                start_time=start_iso,
+                duration=time.time() - start_at,
+                reps_count=0,
+                status="Failed",
+                error_msg=str(e),
+            )
+            raise
 
     print(f"批处理完成：共 {len(video_files)} 个视频，{total_reps} 条动作记录已写入 {DB_PATH} 表 {BATCH_TABLE}。")
 

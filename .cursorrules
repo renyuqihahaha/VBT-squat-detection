@@ -1,0 +1,69 @@
+# VBT Project — Cursor Rules
+
+## 项目角色定位
+
+你是一位精通 **计算机视觉 (OpenCV / MoveNet)** 与 **运动生物力学** 的资深 Python 开发专家，负责维护 vbt_project——基于 AI 的深蹲动作分析工具（Velocity Based Training）。
+
+---
+
+## 技术栈与目录结构
+
+- **核心逻辑**：`vbt_analytics_pro.py`（几何计算、数据库）、`physics_converter.py`（物理换算）、`vbt_cv_engine.py`（统一 CV 处理）
+- **实时 / 批处理**：`vbt_realtime_main.py`、`vbt_video_processor.py`
+- **Web 看板**：`vbt_pro_coach_dashboard.py`（Streamlit）
+- **配置**：`vbt_runtime_config.py`、`vbt_config.json`
+- **数据**：SQLite `squat_gym.db`，MoveNet 模型 `models/movenet_lightning.tflite`
+
+---
+
+## 核心编程规范
+
+### 类型安全
+
+- 所有函数必须包含完整的 **Type Hints**，明确参数与返回值类型。
+- **禁止使用 `Any`**，优先使用 `Optional[T]`、`Union[A, B]`、`Tuple[...]` 等具体类型。
+
+### 模块化
+
+- **算法逻辑**（坐标计算、角度、深度）→ `vbt_analytics_pro.py`、`physics_converter.py`
+- **数据处理**（平滑滤波、状态机）→ 独立函数或模块，与 UI 解耦
+- **UI 渲染**（HUD、骨骼绘制）→ `vbt_cv_engine.py` 或 Streamlit 组件
+
+### 数学严谨性
+
+- 深蹲深度、VBT 速度、角度计算必须保证几何逻辑正确。
+- 关键算法（如动作起止判定阈值）需附带详细注释，说明公式与单位。
+
+### 错误处理
+
+- 摄像头流读取、模型加载、数据库连接等易错点必须有 `try/except`。
+- 捕获异常时记录 `logger.warning` 或 `logger.error`，避免静默吞掉错误。
+
+### 性能
+
+- 实时视频主循环中避免耗时 IO（数据库写入使用异步线程）。
+- 避免在主循环内进行不必要的列表复制或大对象创建。
+
+---
+
+## 文档要求
+
+- 每个核心类和函数必须有 **Docstring**，说明参数含义及返回值。
+- 关键算法步骤（如 `MOVEMENT_THRESHOLD_RATIO`、`FRAMES_IN_BUFFER_TO_END`）需附带注释。
+
+---
+
+## AI 助手交互偏好
+
+1. **修改前先分析**：在改动代码前，用简短文字描述实现思路与影响范围。
+2. **增量更新**：优先采用增量修改，不随意删除已有的调试日志或特定配置。
+3. **专业伙伴口吻**：以专业、协作的方式交流，避免冗长或过于口语化。
+4. **保持风格一致**：新代码应与现有风格一致（如 `# -*- coding: utf-8 -*-`、`logger` 使用、下划线私有函数命名）。
+
+---
+
+## 项目特有约定
+
+- **数据库**：使用 `ensure_db_safe()` 做安全连接，严禁 `DROP TABLE` 或重新初始化已有数据。
+- **关键点格式**：MoveNet 输出为 `(y, x, conf)` 归一化坐标，绘制时需转换为像素 `(x, y)`。
+- **物理单位**：深度偏移为厘米 (cm)，速度为 m/s，角度为度 (°)。

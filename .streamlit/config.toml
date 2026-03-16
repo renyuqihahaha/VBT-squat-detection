@@ -1,0 +1,19 @@
+# VBT Command Center - Streamlit 配置
+# 深色主题 + 允许局域网访问
+
+[theme]
+primaryColor = "#22c55e"
+backgroundColor = "#111827"
+secondaryBackgroundColor = "#1f2937"
+textColor = "#f8fafc"
+font = "sans serif"
+
+[server]
+# 允许从 MacBook 等设备通过树莓派 IP 访问
+address = "0.0.0.0"
+port = 8501
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
