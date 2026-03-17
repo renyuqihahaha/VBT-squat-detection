@@ -11,27 +11,35 @@ PhysicsConverter - 物理转换逻辑封装
 class PhysicsConverter:
     """物理转换：像素转米/厘米、深度偏移量（Plane-to-Plane）。"""
 
-    # 标定常数：站立时头顶到脚踝对应的真实身高（米）
-    REAL_HEIGHT_M = 1.86
     # 深度过滤阈值：±0.5 cm 内视为无效波动（MoveNet 抖动）
     DEPTH_JITTER_THRESHOLD_CM = 0.5
-    # 186cm 体型补偿系数：final_depth = calculated + BIAS_CM
+    # 体型补偿系数：final_depth = calculated + BIAS_CM
     BIAS_CM = 2.0
     # 未标定时的 fallback 系数（1080p）
     DEFAULT_SCALE = 0.0031
+    # 无用户身高时的兜底值（米），仅用于兼容旧调用
+    _FALLBACK_HEIGHT_M = 1.75
 
     def __init__(self, real_height_m=None):
         """
         Args:
-            real_height_m: 可选的标定身高（米），不传则用类常量 REAL_HEIGHT_M
+            real_height_m: 用户真实身高（米），必须由调用方传入。不传时从 vbt_runtime_config 读取。
         """
-        self._real_height_m = real_height_m if real_height_m is not None else PhysicsConverter.REAL_HEIGHT_M
+        if real_height_m is not None:
+            self._real_height_m = float(real_height_m)
+        else:
+            try:
+                from vbt_runtime_config import get_user_height_cm
+                cm = get_user_height_cm()
+                self._real_height_m = (cm / 100.0) if cm and 100 <= cm <= 250 else self._FALLBACK_HEIGHT_M
+            except Exception:
+                self._real_height_m = self._FALLBACK_HEIGHT_M
         self._m_per_pixel = None  # 标定后缓存
 
     def calculate_m_per_pixel(self, pixel_height):
         """
         根据站立时头顶到脚踝像素距离计算 m_per_pixel。
-        m_per_pixel = REAL_HEIGHT_M / pixel_height
+        m_per_pixel = real_height_m / pixel_height（real_height_m 来自构造参数或 vbt_runtime_config）
         Args:
             pixel_height: 头顶到脚踝的垂直像素距离（px）
         Returns:
@@ -79,10 +87,9 @@ class PhysicsConverter:
 
 
 # ================= 便捷函数（兼容现有调用） =================
-# 使用默认实例，保持 vbt_analytics_pro / vbt_main 的导入方式不变
+# 使用默认实例（从 vbt_runtime_config 读取 user_height_cm），保持导入方式不变
 _default_converter = PhysicsConverter()
 
-REAL_HEIGHT_M = PhysicsConverter.REAL_HEIGHT_M
 DEFAULT_SCALE = PhysicsConverter.DEFAULT_SCALE
 DEPTH_JITTER_THRESHOLD_CM = PhysicsConverter.DEPTH_JITTER_THRESHOLD_CM
 

@@ -44,9 +44,14 @@ def merge_batch_reps_by_session(db_path=DB_PATH, dry_run=True):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE batch_reps ADD COLUMN velocity_loss REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute("""
-        SELECT id, filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y
+        SELECT id, filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y, velocity_loss
         FROM batch_reps
         ORDER BY id
     """)
@@ -80,8 +85,8 @@ def merge_batch_reps_by_session(db_path=DB_PATH, dry_run=True):
             # 按顺序重新插入，rep_no 从 1 开始
             for new_rep_no, r in enumerate(ordered, start=1):
                 cur.execute("""
-                    INSERT INTO batch_reps (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO batch_reps (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y, velocity_loss)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     canonical,
                     new_rep_no,
@@ -90,6 +95,7 @@ def merge_batch_reps_by_session(db_path=DB_PATH, dry_run=True):
                     r["max_trunk_angle"],
                     r["dtw_similarity"],
                     r["barbell_path_y"],
+                    r.get("velocity_loss"),
                 ))
             total_rewritten += len(ordered)
             print(f"已合并 Session «{session_id}»: {len(ordered)} 条 -> «{canonical}», rep_no 1..{len(ordered)}")

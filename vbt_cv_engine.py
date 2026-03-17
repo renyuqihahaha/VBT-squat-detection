@@ -518,10 +518,16 @@ def process_squat_video(
             logger.error("无法打开视频文件: %s", video_source)
             return
 
-    video_fps: Optional[float] = None
-    if not is_camera:
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        if video_fps is None or video_fps <= 0:
+    # 物理时间必须基于视频/相机帧率，严禁 time.time()
+    video_fps: float = 30.0
+    if is_camera:
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if video_fps <= 0:
+            video_fps = 30.0
+        logger.info("摄像头模式: nominal FPS=%.1f (用于物理时间)", video_fps)
+    else:
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        if video_fps <= 0:
             video_fps = 30.0
         logger.info("本地视频模式: FPS=%.1f", video_fps)
 
@@ -557,7 +563,7 @@ def process_squat_video(
     y_lowest = -1.0
     y_bottom = -1.0
     starting_height = -1.0
-    t_start_asc = 0.0
+    start_asc_frame_index: int = -1  # 向心阶段起始帧，严禁 time.time()
     prev_inst_v: Optional[float] = None
     rom_completion_pct = 0.0
     last_completed_rom_pct: Optional[float] = None
@@ -584,6 +590,7 @@ def process_squat_video(
     debug_raw_dy_px: Optional[float] = None
     trajectory = deque(maxlen=TRAJECTORY_LEN)
     bar_path_buffer: deque[tuple[int, int]] = deque(maxlen=90)  # 杠铃/重心轨迹，约 3–5 秒
+    current_rep_x_coords: list[float] = []  # 仅 UP 阶段 X 坐标，用于当次 Path Shift
     last_bar_shift_cm: Optional[float] = None
     hip_x_history: list[float] = []
     rep_velocities_in_set: list[float] = []   # 每 Rep 的 rep_mean_vel (平均向心速度)
@@ -954,6 +961,7 @@ def process_squat_video(
                     depth_spoken = False
                     ascent_samples = []
                     bar_path_buffer.clear()
+                    current_rep_x_coords.clear()  # 新深蹲起点，清空 Path Shift 缓存
                     last_up_y, last_up_t = None, None
                     prev_inst_v = None
                     last_completed_rom_pct = None
@@ -967,19 +975,23 @@ def process_squat_video(
                 if smoothed_y < y_lowest - 2:
                     state = "UP"
                     y_bottom = y_lowest
-                    t_start_asc = t_now
+                    start_asc_frame_index = frame_n  # 帧时间起点，严禁 time.time
                     frames_in_buffer = 0
                     last_up_y, last_up_t = smoothed_y, t_now
                     prev_inst_v = None
 
             elif state == "UP":
+                # 仅 UP 阶段收集 X 坐标，用于 Path Shift
+                if tracked_x_raw is not None:
+                    current_rep_x_coords.append(tracked_x_raw)
                 inst_v: Optional[float] = None
-                if last_up_y is not None and last_up_t is not None and scale_m_per_px is not None:
-                    dt = max(t_now - last_up_t, 1e-3)
+                # dt 必须固定为 1/video_fps，严禁 time.time() - last_time
+                dt_video = 1.0 / video_fps
+                if last_up_y is not None and scale_m_per_px is not None:
                     raw_dy_px = abs(smoothed_y - last_up_y)
-                    inst_v = pixel_displacement_to_velocity_m_per_s(raw_dy_px, scale_m_per_px, dt)
+                    inst_v = pixel_displacement_to_velocity_m_per_s(raw_dy_px, scale_m_per_px, dt_video)
                     debug_ratio = scale_m_per_px
-                    debug_dt = dt
+                    debug_dt = dt_video
                     debug_raw_dy_px = raw_dy_px
                     ascent_samples.append(inst_v)
                     current_rep_velocity = inst_v if inst_v >= 0.02 else 0.0
@@ -1006,8 +1018,12 @@ def process_squat_video(
                 frames_in_buffer = frames_in_buffer + 1 if in_buffer else 0
                 rep_done = early_finish or (frames_in_buffer >= FRAMES_IN_BUFFER_TO_END)
                 if rep_done:
-                    duration = t_now - t_start_asc
-                    if duration > 0.05 and y_bottom > 0:
+                    # 向心时间必须用帧数/视频帧率，严禁 time.time()
+                    concentric_frames = frame_n - start_asc_frame_index if start_asc_frame_index >= 0 else 0
+                    concentric_time = concentric_frames / video_fps
+                    if concentric_time <= 0:
+                        concentric_time = 0.001
+                    if concentric_time > 0.05 and y_bottom > 0:
                         bottom_y_px = y_bottom
                         top_y_px = smoothed_y
                         depth_meters = abs(bottom_y_px - top_y_px) * scale_m_per_px
@@ -1016,7 +1032,7 @@ def process_squat_video(
                                 "深度异常: %.3f m (合理范围 %.2f-%.2f m)，请检查 top_y/bottom_y 像素坐标",
                                 depth_meters, DEPTH_MIN_M, DEPTH_MAX_M,
                             )
-                        mcv = depth_meters / duration
+                        mcv = depth_meters / concentric_time
                         rom_m = depth_meters
                         rep_peak_vel = float(max(ascent_samples)) if ascent_samples else 0.0
                         if rom_m >= (min_rom - 0.005) and mcv >= (MIN_MCV_M_S - 0.005):
@@ -1025,10 +1041,10 @@ def process_squat_video(
                             rep_velocities_in_set.append(float(mcv))
                             best_velocity_in_set = max(rep_velocities_in_set)
                             last_rep_peak_vel = rep_peak_vel
-                            if len(bar_path_buffer) >= 2 and scale_m_per_px is not None:
-                                xs = [p[0] for p in bar_path_buffer]
-                                bar_shift_px = max(xs) - min(xs)
-                                last_bar_shift_cm = bar_shift_px * scale_m_per_px * 100.0
+                            # Path Shift 仅用 UP 阶段 collected X，仅在此处结算一次
+                            if len(current_rep_x_coords) > 0 and scale_m_per_px is not None:
+                                shift_px = max(current_rep_x_coords) - min(current_rep_x_coords)
+                                last_bar_shift_cm = shift_px * scale_m_per_px * 100.0
                             if set_rep_count == 1:
                                 current_v_loss = 0.0
                                 stored_loss = None
@@ -1049,6 +1065,7 @@ def process_squat_video(
                     if set_rep_count == 1:
                         reference_max_displacement = abs(starting_height - y_lowest)
                     last_completed_rom_pct = rom_completion_pct
+                    current_rep_x_coords.clear()  # 避免跨 Rep 累加
                     state = "STANDING"
                     y_lowest = -1.0
                     y_bottom = -1.0

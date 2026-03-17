@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from physics_converter import REAL_HEIGHT_M, calculate_m_per_pixel, get_depth_offset, DEFAULT_SCALE
+from physics_converter import calculate_m_per_pixel, get_depth_offset, DEFAULT_SCALE
 
 MODEL_PATH = "models/movenet_lightning.tflite"
 DB_PATH = "squat_gym.db"

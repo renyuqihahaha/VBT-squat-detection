@@ -30,7 +30,7 @@ from vbt_analytics_pro import (
     init_db,
     log_analysis_task,
 )
-from vbt_runtime_config import get_current_user_name
+from vbt_runtime_config import get_current_user_name, get_user_height_cm
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -41,7 +41,7 @@ VIDEOS_DIR = "videos"
 BATCH_TABLE = "batch_reps"
 
 # --- Single-Point: KP11 Left Hip only for counting ---
-TORSO_REF_M = 0.475
+ANATOMY_RATIO_SHOULDER_HIP = 0.30  # 肩中点到髋关节中心约占身高的 30%
 CONF_INTERPOLATE = 0.3                 # conf < 0.3 不置 0，用最近 5 帧有效 Y 平均插值
 MEDIAN_WINDOW = 9                      # 左髋 Y 中值滤波 (window=9) 抗抖
 VALID_Y_HISTORY = 5                    # 插值用最近有效帧数
@@ -70,21 +70,22 @@ def init_batch_table(db_path=DB_PATH):
             barbell_path_y BLOB
         )
     """)
-    try:
-        cur.execute("ALTER TABLE batch_reps ADD COLUMN barbell_path_y BLOB")
-    except sqlite3.OperationalError:
-        pass
+    for col, typ in [("barbell_path_y", "BLOB"), ("velocity_loss", "REAL")]:
+        try:
+            cur.execute(f"ALTER TABLE batch_reps ADD COLUMN {col} {typ}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
 
-def insert_batch_rep(db_path, filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y=None):
+def insert_batch_rep(db_path, filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y=None, velocity_loss=None):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO batch_reps (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y))
+        INSERT INTO batch_reps (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y, velocity_loss)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (filename, rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_similarity, barbell_path_y, velocity_loss))
     conn.commit()
     conn.close()
 
@@ -109,22 +110,32 @@ def init_interpreter():
     return interpreter, input_details, output_details
 
 
-def process_video(video_path, interpreter, input_details, output_details, standard_seq=None, return_seq=False):
+def process_video(video_path, interpreter, input_details, output_details, standard_seq=None, return_seq=False, user_height_cm=None):
     """
     Single-Point: 仅 KP11 (Left Hip) 计数；自适应基线；Median(9)；conf<0.3 用最近 5 帧有效 Y 插值；
     Rep 开始：Y 下移 > movement_threshold（% 身高）；结束：连续 5 帧在缓冲带内；
     MCV 仅从 max_y 帧到回到缓冲带；调试输出 min_y/max_y/delta_y 及拒绝原因。
+    物理时间基于帧索引与视频 FPS，严禁 time.time()。
+    比例尺基于 user_height_cm 动态计算，严禁硬编码。
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps is None or fps <= 0:
+        fps = 30.0
+
+    user_height_m = (float(user_height_cm or get_user_height_cm()) or 175.0) / 100.0
+    torso_ref_m = user_height_m * ANATOMY_RATIO_SHOULDER_HIP
 
     h, w = None, None
     state = "STANDING"
     running_average_standing_y = None
     y_lowest = -1
     y_bottom = -1
-    t_start_asc = 0
+    start_asc_frame = -1
+    frame_idx = 0
     rep_count = 0
     current_rep_sequence = []
     barbell_path_y_list = []
@@ -148,7 +159,7 @@ def process_video(video_path, interpreter, input_details, output_details, standa
         ret, frame = cap.read()
         if not ret:
             break
-        t_curr = time.time()
+        frame_idx += 1
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         elif frame.shape[2] == 4:
@@ -188,7 +199,7 @@ def process_video(video_path, interpreter, input_details, output_details, standa
             hy, hx = last_good_y_hip, last_good_hip_x
             dist_px = np.sqrt((sy - hy) ** 2 + (sx - hx) ** 2)
             if dist_px > 5:
-                scale_m_per_px = TORSO_REF_M / dist_px
+                scale_m_per_px = torso_ref_m / dist_px
                 body_height_px = 2.0 * dist_px
                 lifter_height_m = body_height_px * scale_m_per_px
 
@@ -246,7 +257,7 @@ def process_video(video_path, interpreter, input_details, output_details, standa
                 max_trunk = max(max_trunk, trunk_deg)
             if smoothed_y < y_lowest - 2:
                 state = "UP"
-                t_start_asc = t_curr
+                start_asc_frame = frame_idx
                 y_bottom = y_lowest
                 frames_in_buffer = 0
 
@@ -265,7 +276,10 @@ def process_video(video_path, interpreter, input_details, output_details, standa
             else:
                 frames_in_buffer = 0
             if frames_in_buffer >= FRAMES_IN_BUFFER_TO_END:
-                duration = t_curr - t_start_asc
+                concentric_frames = frame_idx - start_asc_frame if start_asc_frame >= 0 else 0
+                duration = concentric_frames / fps
+                if duration <= 0:
+                    duration = 0.001
                 min_y_rep = running_average_standing_y
                 max_y_rep = y_bottom
                 delta_y_px = max_y_rep - min_y_rep
@@ -331,7 +345,10 @@ def main():
     parser = argparse.ArgumentParser(description="VBT 视频批处理 / 单视频补充分析")
     parser.add_argument("--video", type=str, default=None, metavar="FILE",
                         help="仅处理指定视频并补充到数据库（会先删除该文件已有记录）。例: --video IMG_1696 或 --video IMG_1696（1）.mov")
+    parser.add_argument("--user-height", type=float, default=None, metavar="CM",
+                        help="用户身高 (cm)，用于动态比例尺。不传则从 vbt_config.json 读取。")
     args = parser.parse_args()
+    user_height_cm = args.user_height if args.user_height is not None else get_user_height_cm()
 
     videos_dir = VIDEOS_DIR
     if not os.path.isdir(videos_dir):
@@ -378,8 +395,15 @@ def main():
         start_at = time.time()
         start_iso = datetime.now().isoformat()
         try:
-            reps = process_video(video_path, interpreter, input_details, output_details, standard_seq)
+            reps = list(process_video(video_path, interpreter, input_details, output_details, standard_seq, user_height_cm=user_height_cm))
+            # 统一使用 Mean Velocity 计算 velocity_loss，严禁 peak_velocity / max_inst_vel
+            rep_mean_velocities = [r[1] for r in reps]
+            best_mean_vel = max(rep_mean_velocities) if rep_mean_velocities else 0.0
             for rep_no, v_mean, min_knee_angle, max_trunk_angle, dtw_sim, barbell_path_blob in reps:
+                velocity_loss_pct = (
+                    (best_mean_vel - v_mean) / best_mean_vel * 100.0
+                    if best_mean_vel > 0 else 0.0
+                )
                 insert_batch_rep(
                     DB_PATH,
                     filename=filename,
@@ -389,12 +413,14 @@ def main():
                     max_trunk_angle=max_trunk_angle,
                     dtw_similarity=dtw_sim,
                     barbell_path_y=barbell_path_blob,
+                    velocity_loss=round(velocity_loss_pct, 1),
                 )
                 total_reps += 1
                 ka = f"{min_knee_angle:.1f}°" if min_knee_angle is not None else "—"
                 ta = f"{max_trunk_angle:.1f}°" if max_trunk_angle is not None else "—"
                 sim = f"{dtw_sim:.3f}" if dtw_sim is not None else "—"
-                print(f"  动作 {rep_no} | MCV={v_mean:.3f} m/s | 最小膝角={ka} | 躯干最大倾角={ta} | 相似度={sim}")
+                vl = f"{velocity_loss_pct:.1f}%" if best_mean_vel > 0 else "—"
+                print(f"  动作 {rep_no} | MCV={v_mean:.3f} m/s | 流失={vl} | 最小膝角={ka} | 躯干最大倾角={ta} | 相似度={sim}")
             log_analysis_task(
                 DB_PATH,
                 video_name=filename,
