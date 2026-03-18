@@ -31,6 +31,20 @@ from vbt_analytics_pro import (
     log_analysis_task,
 )
 from vbt_runtime_config import get_current_user_name, get_user_height_cm
+from squat_analysis_core import (
+    letterbox_preprocess,
+    unpad_keypoints_array,
+    CalibrationState,
+    SquatStateMachine,
+    HipTracker,
+    MEDIAN_WINDOW,
+    VALID_Y_HISTORY,
+    MOVEMENT_THRESHOLD_RATIO,
+    BUFFER_RATIO,
+    FRAMES_IN_BUFFER_TO_END,
+    MIN_ROM_RATIO,
+    MIN_MCV_M_S,
+)
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -39,18 +53,6 @@ except ImportError:
 
 VIDEOS_DIR = "videos"
 BATCH_TABLE = "batch_reps"
-
-# --- Single-Point: KP11 Left Hip only for counting ---
-ANATOMY_RATIO_SHOULDER_HIP = 0.30  # 肩中点到髋关节中心约占身高的 30%
-CONF_INTERPOLATE = 0.3                 # conf < 0.3 不置 0，用最近 5 帧有效 Y 平均插值
-MEDIAN_WINDOW = 9                      # 左髋 Y 中值滤波 (window=9) 抗抖
-VALID_Y_HISTORY = 5                    # 插值用最近有效帧数
-MOVEMENT_THRESHOLD_RATIO = 0.08        # 相对身高：下移超过此比例才触发 rep 开始（0.10→0.08 提高检出）
-BUFFER_RATIO = 0.05                    # 相对身高：缓冲带 = ±5% 身高 (px)
-FRAMES_IN_BUFFER_TO_END = 5            # 连续 5 帧在缓冲带内则 rep 结束
-# 按 ground truth 校准：331891/425005/867354 各 8，532794 为 6，637838 为 4，721883/807405 各 1
-MIN_ROM_RATIO = 0.10                   # 有效 rep：ROM > 10% 身高（使 10.8cm 等边界通过）
-MIN_MCV_M_S = 0.02                     # MCV 下限降至 0.02，避免 0.03–0.08 的慢速有效 rep 被拒
 
 
 def init_batch_table(db_path=DB_PATH):
@@ -112,11 +114,13 @@ def init_interpreter():
 
 def process_video(video_path, interpreter, input_details, output_details, standard_seq=None, return_seq=False, user_height_cm=None):
     """
-    Single-Point: 仅 KP11 (Left Hip) 计数；自适应基线；Median(9)；conf<0.3 用最近 5 帧有效 Y 插值；
-    Rep 开始：Y 下移 > movement_threshold（% 身高）；结束：连续 5 帧在缓冲带内；
-    MCV 仅从 max_y 帧到回到缓冲带；调试输出 min_y/max_y/delta_y 及拒绝原因。
-    物理时间基于帧索引与视频 FPS，严禁 time.time()。
-    比例尺基于 user_height_cm 动态计算，严禁硬编码。
+    统一离线批处理入口。
+    与实时模式 (vbt_cv_engine.py) 使用完全相同的：
+      - letterbox 预处理（消除几何失真）
+      - unpad_keypoints_array 坐标还原
+      - CalibrationState 标定状态机
+      - SquatStateMachine / HipTracker 动作状态机
+    物理时间严格基于帧索引 / 视频 FPS，严禁 time.time()。
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -127,203 +131,137 @@ def process_video(video_path, interpreter, input_details, output_details, standa
         fps = 30.0
 
     user_height_m = (float(user_height_cm or get_user_height_cm()) or 175.0) / 100.0
-    torso_ref_m = user_height_m * ANATOMY_RATIO_SHOULDER_HIP
 
-    h, w = None, None
-    state = "STANDING"
-    running_average_standing_y = None
-    y_lowest = -1
-    y_bottom = -1
-    start_asc_frame = -1
+    calib = CalibrationState(user_height_m)
+    tracker = HipTracker(is_bodyweight=False)
+    state_machine: SquatStateMachine | None = None  # 标定完成后初始化
+
     frame_idx = 0
-    rep_count = 0
-    current_rep_sequence = []
-    barbell_path_y_list = []
+    results = []
+    current_rep_sequence: list = []
+    barbell_path_y_list: list = []
     first_rep_sequence = None
     min_left_knee = 180.0
     min_right_knee = 180.0
     max_trunk = -1.0
-    results = []
-    scale_m_per_px = None
-    body_height_px = None
-    lifter_height_m = None
-    last_good_y_shld = None
-    last_good_y_hip = None
-    last_good_shld_x = None
-    last_good_hip_x = None
-    valid_y_deque = deque(maxlen=VALID_Y_HISTORY)
-    median_hist = deque(maxlen=MEDIAN_WINDOW)
-    frames_in_buffer = 0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame_idx += 1
+
+        # BGR -> RGB
         if frame.ndim == 2:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
         elif frame.shape[2] == 4:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
         else:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if h is None:
-            h, w = frame.shape[0], frame.shape[1]
+        h, w = frame_rgb.shape[:2]
 
-        input_data = np.expand_dims(cv2.resize(frame, (192, 192)), axis=0).astype(np.uint8)
-        interpreter.set_tensor(input_details[0]["index"], input_data)
+        # ── 统一 letterbox 预处理（与实时模式完全相同） ──
+        padded, offset_x, offset_y, scale = letterbox_preprocess(frame_rgb)
+        inp = np.expand_dims(padded, axis=0).astype(np.uint8)
+        interpreter.set_tensor(input_details[0]["index"], inp)
         interpreter.invoke()
-        keypoints = interpreter.get_tensor(output_details[0]["index"])[0][0]
+        kps_raw = interpreter.get_tensor(output_details[0]["index"])[0][0]
 
-        conf5 = float(keypoints[5][2])
-        conf11 = float(keypoints[11][2])
-        if conf5 >= 0.3:
-            last_good_y_shld = keypoints[5][0] * h
-            last_good_shld_x = keypoints[5][1] * w
-        if conf11 >= CONF_INTERPOLATE:
-            raw_y_hip = keypoints[11][0] * h
-            valid_y_deque.append(raw_y_hip)
-            last_good_y_hip = raw_y_hip
-            last_good_hip_x = keypoints[11][1] * w
-            y_to_use = raw_y_hip
-        else:
-            y_to_use = float(np.mean(valid_y_deque)) if valid_y_deque else None
-        if y_to_use is None:
+        # ── 统一坐标还原（与实时模式完全相同） ──
+        kps = unpad_keypoints_array(kps_raw, h, w, offset_x, offset_y, scale)
+
+        # ── 标定 ──
+        sm_state = state_machine.state if state_machine is not None else "STANDING"
+        calib.update(kps, frame_idx, sm_state)
+        if not calib.is_done:
             continue
 
-        median_hist.append(y_to_use)
-        smoothed_y = float(np.median(median_hist)) if len(median_hist) >= MEDIAN_WINDOW else y_to_use
+        # 标定完成后延迟初始化状态机
+        if state_machine is None:
+            state_machine = SquatStateMachine(
+                body_height_px=calib.body_height_px,
+                user_height_m=user_height_m,
+                video_fps=fps,
+            )
 
-        if scale_m_per_px is None and last_good_y_shld is not None and last_good_y_hip is not None and last_good_shld_x is not None and last_good_hip_x is not None:
-            sy, sx = last_good_y_shld, last_good_shld_x
-            hy, hx = last_good_y_hip, last_good_hip_x
-            dist_px = np.sqrt((sy - hy) ** 2 + (sx - hx) ** 2)
-            if dist_px > 5:
-                scale_m_per_px = torso_ref_m / dist_px
-                body_height_px = 2.0 * dist_px
-                lifter_height_m = body_height_px * scale_m_per_px
-
-        if scale_m_per_px is None or body_height_px is None:
+        # ── 跟踪 ──
+        smoothed_y, raw_y, raw_x = tracker.update(kps)
+        if smoothed_y is None:
             continue
 
-        movement_threshold_px = MOVEMENT_THRESHOLD_RATIO * body_height_px
-        buffer_px = BUFFER_RATIO * body_height_px
-
-        l_hip = keypoints[11] if conf11 >= CONF_THRESHOLD else None
-        l_knee = keypoints[13] if keypoints[13][2] > CONF_THRESHOLD else None
-        r_knee = keypoints[14] if keypoints[14][2] > CONF_THRESHOLD else None
-        l_ankle = keypoints[15] if keypoints[15][2] > CONF_THRESHOLD else None
-        r_ankle = keypoints[16] if keypoints[16][2] > CONF_THRESHOLD else None
-        r_hip = keypoints[12] if keypoints[12][2] > CONF_THRESHOLD else None
-        left_knee_deg = angle_deg(l_hip, l_knee, l_ankle) if l_hip is not None else None
+        # ── 角度计算（用于 results 输出） ──
+        conf5  = float(kps[5][2])  if len(kps) > 5  else 0.0
+        conf11 = float(kps[11][2]) if len(kps) > 11 else 0.0
+        conf12 = float(kps[12][2]) if len(kps) > 12 else 0.0
+        l_hip   = kps[11] if conf11 >= CONF_THRESHOLD else None
+        r_hip   = kps[12] if conf12 >= CONF_THRESHOLD else None
+        l_knee  = kps[13] if kps[13][2] > CONF_THRESHOLD else None
+        r_knee  = kps[14] if kps[14][2] > CONF_THRESHOLD else None
+        l_ankle = kps[15] if kps[15][2] > CONF_THRESHOLD else None
+        r_ankle = kps[16] if kps[16][2] > CONF_THRESHOLD else None
+        left_knee_deg  = angle_deg(l_hip, l_knee, l_ankle) if l_hip is not None else None
         right_knee_deg = angle_deg(r_hip, r_knee, r_ankle) if r_hip is not None else None
-        shoulder_mid = (keypoints[5][0], keypoints[5][1]) if conf5 >= 0.2 else None
-        hip_mid = (keypoints[11][0], keypoints[11][1]) if conf11 >= 0.2 else None
+        shoulder_mid = (kps[5][0], kps[5][1]) if conf5 >= 0.2 else None
+        hip_mid = (
+            ((float(l_hip[0]) + float(r_hip[0])) / 2.0,
+             (float(l_hip[1]) + float(r_hip[1])) / 2.0)
+            if l_hip is not None and r_hip is not None else None
+        )
         trunk_deg = trunk_angle_deg(shoulder_mid, hip_mid)
-        lk = left_knee_deg if left_knee_deg is not None else 0.0
+        lk = left_knee_deg  if left_knee_deg  is not None else 0.0
         rk = right_knee_deg if right_knee_deg is not None else 0.0
-        tr = trunk_deg if trunk_deg is not None else 0.0
+        tr = trunk_deg      if trunk_deg      is not None else 0.0
 
-        if state == "STANDING":
-            if running_average_standing_y is None:
-                running_average_standing_y = smoothed_y
-            else:
-                running_average_standing_y = 0.97 * running_average_standing_y + 0.03 * smoothed_y
-            if smoothed_y >= running_average_standing_y + movement_threshold_px:
-                state = "DOWN"
-                y_lowest = smoothed_y
-                barbell_path_y_list = [smoothed_y]
-                current_rep_sequence = [(lk, rk, tr)]
-                min_left_knee = 180.0
-                min_right_knee = 180.0
-                max_trunk = -1.0
-                if left_knee_deg is not None:
-                    min_left_knee = min(min_left_knee, left_knee_deg)
-                if right_knee_deg is not None:
-                    min_right_knee = min(min_right_knee, right_knee_deg)
-                if trunk_deg is not None:
-                    max_trunk = max(max_trunk, trunk_deg)
-
-        elif state == "DOWN":
-            if smoothed_y > y_lowest:
-                y_lowest = smoothed_y
-            barbell_path_y_list.append(smoothed_y)
+        # 累计本 rep 的角度/序列数据
+        if state_machine.state in ("DOWN", "UP"):
             current_rep_sequence.append((lk, rk, tr))
-            if left_knee_deg is not None:
-                min_left_knee = min(min_left_knee, left_knee_deg)
-            if right_knee_deg is not None:
-                min_right_knee = min(min_right_knee, right_knee_deg)
-            if trunk_deg is not None:
-                max_trunk = max(max_trunk, trunk_deg)
-            if smoothed_y < y_lowest - 2:
-                state = "UP"
-                start_asc_frame = frame_idx
-                y_bottom = y_lowest
-                frames_in_buffer = 0
-
-        elif state == "UP":
             barbell_path_y_list.append(smoothed_y)
-            current_rep_sequence.append((lk, rk, tr))
-            if left_knee_deg is not None:
-                min_left_knee = min(min_left_knee, left_knee_deg)
-            if right_knee_deg is not None:
-                min_right_knee = min(min_right_knee, right_knee_deg)
-            if trunk_deg is not None:
-                max_trunk = max(max_trunk, trunk_deg)
-            in_buffer = abs(smoothed_y - running_average_standing_y) <= buffer_px
-            if in_buffer:
-                frames_in_buffer += 1
-            else:
-                frames_in_buffer = 0
-            if frames_in_buffer >= FRAMES_IN_BUFFER_TO_END:
-                concentric_frames = frame_idx - start_asc_frame if start_asc_frame >= 0 else 0
-                duration = concentric_frames / fps
-                if duration <= 0:
-                    duration = 0.001
-                min_y_rep = running_average_standing_y
-                max_y_rep = y_bottom
-                delta_y_px = max_y_rep - min_y_rep
-                delta_y_m = delta_y_px * scale_m_per_px
-                if duration > 0.05 and y_bottom > 0:
-                    rom_m = (y_bottom - smoothed_y) * scale_m_per_px
-                    mcv = rom_m / duration
-                    min_rom = MIN_ROM_RATIO * lifter_height_m
-                    min_knee_angle = min(min_left_knee, min_right_knee)
-                    if min_knee_angle > 179:
-                        min_knee_angle = None
-                    if max_trunk < 0:
-                        max_trunk = None
-                    valid = rom_m >= (min_rom - 0.005) and mcv >= (MIN_MCV_M_S - 0.005)
-                    print(f"  [DEBUG] min_y={min_y_rep:.1f} max_y={max_y_rep:.1f} delta_y_px={delta_y_px:.1f} delta_y_m={delta_y_m*100:.1f}cm ROM={rom_m*100:.1f}cm MCV={mcv:.2f} m/s")
-                    if valid:
-                        rep_count += 1
-                        dtw_sim = None
-                        if standard_seq and current_rep_sequence:
-                            dtw_sim = dtw_similarity(current_rep_sequence, standard_seq)
-                            dtw_sim = round(dtw_sim, 4) if dtw_sim is not None else None
-                        path_blob = np.array(barbell_path_y_list, dtype=np.float32).tobytes()
-                        results.append((rep_count, mcv, min_knee_angle, max_trunk, dtw_sim, path_blob))
-                        if return_seq and rep_count == 1 and len(current_rep_sequence) > 5:
-                            first_rep_sequence = list(current_rep_sequence)
-                        print(f"  ✅ 有效 rep {rep_count} | MCV: {mcv:.2f} m/s | ROM: {rom_m*100:.0f}cm")
-                    else:
-                        reasons = []
-                        if rom_m < min_rom:
-                            reasons.append(f"ROM {rom_m*100:.0f}cm < {min_rom*100:.0f}cm")
-                        if mcv < MIN_MCV_M_S:
-                            reasons.append(f"MCV {mcv:.2f} < {MIN_MCV_M_S}")
-                        print(f"  ❌ 拒绝: {'; '.join(reasons)}")
-                state = "STANDING"
-                y_lowest = -1
-                y_bottom = -1
-                frames_in_buffer = 0
-                barbell_path_y_list = []
-                current_rep_sequence = []
+            if left_knee_deg  is not None: min_left_knee  = min(min_left_knee,  left_knee_deg)
+            if right_knee_deg is not None: min_right_knee = min(min_right_knee, right_knee_deg)
+            if trunk_deg      is not None: max_trunk       = max(max_trunk,      trunk_deg)
+        elif state_machine.state == "STANDING":
+            # 新 rep 开始时重置
+            current_rep_sequence = []
+            barbell_path_y_list  = []
+            min_left_knee  = 180.0
+            min_right_knee = 180.0
+            max_trunk      = -1.0
+
+        # ── 状态机推进 ──
+        state_machine.update(smoothed_y, frame_idx, calib.ratio)
+
+        # ── 消费完成的 rep ──
+        if state_machine.finished_rep is not None:
+            rep = state_machine.finished_rep
+            state_machine.finished_rep = None
+
+            min_knee_angle = min(min_left_knee, min_right_knee)
+            if min_knee_angle > 179:
+                min_knee_angle = None
+            max_trunk_out = max_trunk if max_trunk >= 0 else None
+
+            dtw_sim = None
+            if standard_seq and current_rep_sequence:
+                dtw_sim = dtw_similarity(current_rep_sequence, standard_seq)
+                dtw_sim = round(dtw_sim, 4) if dtw_sim is not None else None
+
+            path_blob = np.array(barbell_path_y_list, dtype=np.float32).tobytes() if barbell_path_y_list else None
+            results.append((rep.rep_index, rep.mcv, min_knee_angle, max_trunk_out, dtw_sim, path_blob))
+
+            if return_seq and rep.rep_index == 1 and len(current_rep_sequence) > 5:
+                first_rep_sequence = list(current_rep_sequence)
+
+            delta_y_m = rep.rom_m
+            print(
+                f"  ✅ 有效 rep {rep.rep_index} | MCV: {rep.mcv:.2f} m/s"
+                f" | ROM: {delta_y_m*100:.0f}cm | t={rep.concentric_time_s:.2f}s"
+            )
 
     cap.release()
     if return_seq:
         return results, (first_rep_sequence if first_rep_sequence else [])
-    return results
+    return results   
 
 
 def _resolve_single_video(video_arg, videos_dir):
@@ -421,6 +359,33 @@ def main():
                 sim = f"{dtw_sim:.3f}" if dtw_sim is not None else "—"
                 vl = f"{velocity_loss_pct:.1f}%" if best_mean_vel > 0 else "—"
                 print(f"  动作 {rep_no} | MCV={v_mean:.3f} m/s | 流失={vl} | 最小膝角={ka} | 躯干最大倾角={ta} | 相似度={sim}")
+            # ── Finalize set: persist set summary + AI prediction ─────
+            if rep_mean_velocities:
+                try:
+                    from vbt_set_finalizer import finalize_set
+                    import uuid as _uuid
+                    _vid_session_id = f"video_{os.path.splitext(filename)[0]}"
+                    _rep_rows = [
+                        {"v_mean": r[1], "rom": 0.3, "velocity_loss": 0.0,
+                         "calib_is_fallback": False, "pose_issues": None,
+                         "left_knee_angle": r[2] or 90.0,
+                         "right_knee_angle": r[2] or 90.0,
+                         "trunk_angle": r[3] or 15.0}
+                        for r in reps
+                    ]
+                    _result = finalize_set(
+                        session_id=_vid_session_id,
+                        set_number=1,
+                        user_name=get_current_user_name(),
+                        mode="Strength",
+                        load_kg=0.0,
+                        rep_rows=_rep_rows,
+                        db_path=DB_PATH,
+                    )
+                    if _result:
+                        print(f"  AI 推荐: {_result.recommendation_action} (fatigue={_result.fatigue_risk:.2f}, fallback={_result.fatigue_model_status})")
+                except Exception as _fe:
+                    print(f"  [警告] set finalize 失败: {_fe}")
             log_analysis_task(
                 DB_PATH,
                 video_name=filename,

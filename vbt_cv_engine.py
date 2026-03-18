@@ -30,6 +30,11 @@ from vbt_analytics_pro import (
 )
 from vbt_runtime_config import get_current_load_kg, get_current_user_name, get_user_height_cm
 from physics_converter import get_depth_offset, pixel_displacement_to_velocity_m_per_s
+from squat_analysis_core import (
+    CalibrationState,
+    letterbox_preprocess as _letterbox_preprocess_core,
+    unpad_keypoints_array as _kps_to_frame_coords_core,
+)
 from vbt_fatigue_analyst import (
     compute_realtime_rom_percent,
     compute_standing_baseline,
@@ -81,6 +86,41 @@ logger = logging.getLogger("vbt_cv_engine")
 
 # 边缘计算性能指标（供 Dashboard 实时读取）
 _cv_engine_metrics: dict = {"latency_ms": None, "fps": None}
+
+
+def _finalize_set_from_velocities(
+    session_id: str,
+    set_number: int,
+    user_name: str,
+    rep_velocities: list[float],
+    db_path: str,
+    load_kg: float = 0.0,
+    mode: str = "Strength",
+) -> None:
+    """
+    Lightweight set finalizer called from cv_engine on set-end.
+    Builds minimal rep_rows from velocities and delegates to vbt_set_finalizer.
+    Always writes even when DL models are missing (rule-based fallback).
+    """
+    try:
+        from vbt_set_finalizer import finalize_set
+        rep_rows = [
+            {"v_mean": v, "rom": 0.3, "velocity_loss": 0.0,
+             "calib_is_fallback": False, "pose_issues": None,
+             "left_knee_angle": 90.0, "right_knee_angle": 90.0, "trunk_angle": 15.0}
+            for v in rep_velocities
+        ]
+        finalize_set(
+            session_id=session_id,
+            set_number=set_number,
+            user_name=user_name,
+            mode=mode,
+            load_kg=load_kg,
+            rep_rows=rep_rows,
+            db_path=db_path,
+        )
+    except Exception as e:
+        logger.warning("_finalize_set_from_velocities failed: %s", e)
 
 # 动态解剖标定提示（模块加载时打印一次）
 print(
@@ -308,17 +348,22 @@ def _insert_rep_async(
     session_id: Optional[str] = None,
     user_height: Optional[float] = None,
     pose_issues: Optional[str] = None,
+    calib_method: Optional[str] = None,
+    calib_is_fallback: Optional[bool] = None,
+    timing_source: Optional[str] = None,
 ) -> None:
-    def _do() -> None:
-        try:
-            insert_rep(
-                db_path, rep_count, v_mean, rom, left_knee, right_knee, trunk, dtw_sim,
-                depth_offset_cm, load_kg, velocity_loss, user_name, rom_completion_pct,
-                set_number, session_id, user_height, pose_issues,
-            )
-        except Exception as e:
-            logger.warning(f"异步写入 rep 失败: {e}")
-    threading.Thread(target=_do, daemon=True).start()
+    """insert_rep 现在已经是写队列异步写入，直接调用即可，无需额外线程。"""
+    try:
+        insert_rep(
+            db_path, rep_count, v_mean, rom, left_knee, right_knee, trunk, dtw_sim,
+            depth_offset_cm, load_kg, velocity_loss, user_name, rom_completion_pct,
+            set_number, session_id, user_height, pose_issues,
+            calib_method=calib_method,
+            calib_is_fallback=calib_is_fallback,
+            timing_source=timing_source,
+        )
+    except Exception as e:
+        logger.warning("rep 写入入队失败: %s", e)
 
 
 def _render_hud(
@@ -548,14 +593,15 @@ def process_squat_video(
         user_height_cm = 175.0
     user_height_m = user_height_cm / 100.0
 
-    # ── 动态解剖自适应标定状态 ──
+    # ── 动态解剖自适应标定（使用 squat_analysis_core.CalibrationState，消除重复逻辑） ──
+    _calib = CalibrationState(user_height_m)
     is_calibrated = False
     pixel_to_meter_ratio = 0.0
-    calib_samples_primary: list[float] = []    # 肩-踝样本池
-    calib_samples_secondary: list[float] = []  # 鼻-踝样本池
-    calib_samples_tertiary: list[float] = []   # 肩-髋样本池
-    plate_diameter_samples: list[float] = []   # 杠铃片直径样本池（兜底标定）
-    force_tertiary_calib = False               # 前 5 帧无踝则强制肩髋法
+    scale_m_per_px = None
+    body_height_px = None
+    calibration_fallback = False
+    plate_diameter_samples: list[float] = []   # 杠铃片直径样本池（板片标定兜底）
+    force_tertiary_calib = False               # 兼容旧变量名（用于 HUD 显示）
 
     state = "STANDING"
     phase_cn = "Waiting for pose"
@@ -584,7 +630,8 @@ def process_squat_video(
     ascent_samples = []
     last_up_y = None
     last_up_t = None
-    last_frame_time: Optional[float] = None  # 真实时间戳，用于 dt 计算
+    last_frame_time: Optional[float] = None  # wall-clock for FPS measurement only
+    last_mono_time: Optional[float] = None   # monotonic clock for live-camera dt
     debug_ratio: Optional[float] = None
     debug_dt: Optional[float] = None
     debug_raw_dy_px: Optional[float] = None
@@ -651,6 +698,19 @@ def process_squat_video(
                     cv2.putText(summary_frame, f"Best Mean Vel: {best_mean_s:.3f} m/s", (80, 290), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
                     best_mean_end = max(rep_velocities_in_set) if rep_velocities_in_set else 0.0
                     last_mean_end = rep_velocities_in_set[-1] if rep_velocities_in_set else 0.0
+                    # ── Finalize set on video-end (always, even in fallback) ─
+                    if rep_velocities_in_set and session_id:
+                        try:
+                            _finalize_set_from_velocities(
+                                session_id=session_id,
+                                set_number=set_number or 1,
+                                user_name=get_current_user_name(),
+                                rep_velocities=list(rep_velocities_in_set),
+                                db_path=DB_PATH,
+                                load_kg=get_current_load_kg(),
+                            )
+                        except Exception as _fe:
+                            logger.warning("set finalize failed: %s", _fe)
                     yield summary_frame, {
                         "video_ended": True,
                         "summary": summary,
@@ -668,11 +728,14 @@ def process_squat_video(
 
         frame_start = time.time()
         t_now = frame_start
+        mono_now = time.monotonic()
         if last_frame_time is not None:
             dt_frame = t_now - last_frame_time
             if dt_frame < MIN_DT_S:
                 continue  # 跳过过近帧，防止零除
         last_frame_time = t_now
+        last_mono_time_prev = last_mono_time
+        last_mono_time = mono_now
         frame_n += 1
         fps_n += 1
         if (t_now - fps_t0) >= 1.0:
@@ -730,34 +793,8 @@ def process_squat_video(
         y_hip = tracked_y_raw
 
         if not is_calibrated:
-            if is_bodyweight:
-                conf5 = float(kps[5][2])
-                conf6 = float(kps[6][2])
-                la_conf = float(kps[15][2])
-                ra_conf = float(kps[16][2])
-                vis = CALIB_VISIBILITY_RELAXED
-                shoulders_visible = conf5 >= vis or conf6 >= vis
-                ankles_visible = la_conf >= vis or ra_conf >= vis
-                if state == "STANDING" and shoulders_visible and ankles_visible and frame_n <= CALIB_FREEZE_FRAMES:
-                    shoulder_ys = [float(kps[i][0]) for i in (5, 6) if float(kps[i][2]) >= vis]
-                    ankle_ys = [float(kps[i][0]) for i in (15, 16) if float(kps[i][2]) >= vis]
-                    if shoulder_ys and ankle_ys:
-                        shoulder_y = float(np.mean(shoulder_ys))
-                        ankle_y = float(np.mean(ankle_ys))
-                        pixel_dist = abs(ankle_y - shoulder_y)
-                        if pixel_dist > 30:
-                            calib_samples_primary.append(pixel_dist)
-                if len(calib_samples_primary) >= MIN_CALIB_SAMPLES:
-                    median_pixels = float(np.median(calib_samples_primary))
-                    pixel_to_meter_ratio = (user_height_m * ANATOMY_RATIO_SHOULDER_ANKLE) / median_pixels
-                    scale_m_per_px = pixel_to_meter_ratio
-                    body_height_px = median_pixels / ANATOMY_RATIO_SHOULDER_ANKLE
-                    is_calibrated = True
-                    logger.info(
-                        "自重模式标定完成 (肩踝法): height=%.0fcm, median_px=%.1f, ratio=%.6f m/px",
-                        user_height_cm, median_pixels, pixel_to_meter_ratio,
-                    )
-            elif not is_bodyweight and use_plate_calibration and frame_n <= CALIB_FREEZE_FRAMES:
+            # ── 板片标定（优先，若启用） ──
+            if not is_bodyweight and use_plate_calibration and frame_n <= CALIB_FREEZE_FRAMES:
                 d_px = _detect_plate_diameter_px(frame_bgr)
                 if d_px is not None and d_px > 30:
                     plate_diameter_samples.append(d_px)
@@ -773,136 +810,45 @@ def process_squat_video(
                         median_d, pixel_to_meter_ratio,
                     )
 
-            if not is_bodyweight:
-                conf5 = float(kps[5][2])
-                conf6 = float(kps[6][2])
-                conf11 = float(kps[11][2])
-                conf12 = float(kps[12][2])
-                nose_conf = float(kps[0][2])
-                la_conf = float(kps[15][2])
-                ra_conf = float(kps[16][2])
-                vis = CALIB_VISIBILITY_RELAXED
-                shoulders_visible = conf5 >= vis or conf6 >= vis
-                ankles_visible = la_conf >= vis or ra_conf >= vis
-                nose_visible = nose_conf >= vis
-                hips_visible = conf11 >= vis or conf12 >= vis
+            # ── 解剖标定：委托给 CalibrationState（消除重复逻辑） ──
+            if not is_calibrated:
+                _calib.update(kps, frame_n, state)
+                if _calib.is_done:
+                    pixel_to_meter_ratio = _calib.ratio
+                    scale_m_per_px = _calib.ratio
+                    body_height_px = _calib.body_height_px
+                    calibration_fallback = _calib.is_fallback
+                    force_tertiary_calib = (_calib.method == "shoulder_hip")
+                    is_calibrated = True
 
-                if frame_n <= ANKLE_FALLBACK_FRAMES and tracked_y_raw is not None and not ankles_visible:
-                    force_tertiary_calib = True
-
-                in_calib_window = frame_n <= max(CALIB_FREEZE_FRAMES, CALIB_FORCE_FRAMES)
-                allow_sample = in_calib_window and (state == "STANDING" or frame_n <= CALIB_FORCE_FRAMES)
-                person_detected = tracked_y_raw is not None
-
-                if not is_calibrated and allow_sample and person_detected:
-                    if not force_tertiary_calib and shoulders_visible and ankles_visible:
-                        shoulder_ys = [float(kps[i][0]) for i in (5, 6) if float(kps[i][2]) >= vis]
-                        ankle_ys = [float(kps[i][0]) for i in (15, 16) if float(kps[i][2]) >= vis]
-                        if shoulder_ys and ankle_ys:
-                            shoulder_y = float(np.mean(shoulder_ys))
-                            ankle_y = float(np.mean(ankle_ys))
-                            pixel_dist = abs(ankle_y - shoulder_y)
-                            if pixel_dist > 30:
-                                calib_samples_primary.append(pixel_dist)
-                    elif not force_tertiary_calib and not shoulders_visible and nose_visible and ankles_visible:
-                        ankle_ys = [float(kps[i][0]) for i in (15, 16) if float(kps[i][2]) >= vis]
-                        if ankle_ys:
-                            nose_y = float(kps[0][0])
-                            ankle_y = float(np.mean(ankle_ys))
-                            pixel_dist = abs(ankle_y - nose_y)
-                            if pixel_dist > 20:
-                                calib_samples_secondary.append(pixel_dist)
-                    if force_tertiary_calib or (not ankles_visible and shoulders_visible and hips_visible):
-                        shoulder_ys = [float(kps[i][0]) for i in (5, 6) if float(kps[i][2]) >= vis]
-                        hip_ys = [float(kps[i][0]) for i in (11, 12) if float(kps[i][2]) >= vis]
-                        if shoulder_ys and hip_ys:
-                            shoulder_y = float(np.mean(shoulder_ys))
-                            hip_y = float(np.mean(hip_ys))
-                            pixel_dist = abs(hip_y - shoulder_y)
-                            if pixel_dist > 5:
-                                calib_samples_tertiary.append(pixel_dist)
-
-            if frame_n > CALIB_TIMEOUT_FRAMES and not is_calibrated:
-                pixel_to_meter_ratio = DEFAULT_FALLBACK_RATIO
-                scale_m_per_px = pixel_to_meter_ratio
-                body_height_px = user_height_m / pixel_to_meter_ratio
-                is_calibrated = True
-                logger.warning(
-                    "标定超时 (frame %d)，强制使用默认比例尺 %.6f m/px",
-                    frame_n, pixel_to_meter_ratio,
-                )
-
-            if not force_tertiary_calib and len(calib_samples_primary) >= MIN_CALIB_SAMPLES:
-                median_pixels = float(np.median(calib_samples_primary))
-                pixel_to_meter_ratio = (user_height_m * ANATOMY_RATIO_SHOULDER_ANKLE) / median_pixels
-                scale_m_per_px = pixel_to_meter_ratio
-                body_height_px = median_pixels / ANATOMY_RATIO_SHOULDER_ANKLE
-                is_calibrated = True
-                logger.info(
-                    "动态解剖标定完成 (肩踝法): height=%.0fcm, median_px=%.1f, pixel_to_meter_ratio=%.6f m/px [168cm/720p 合理范围 0.003-0.005]",
-                    user_height_cm, median_pixels, pixel_to_meter_ratio,
-                )
-            elif not force_tertiary_calib and len(calib_samples_secondary) >= MIN_CALIB_SAMPLES:
-                median_pixels = float(np.median(calib_samples_secondary))
-                pixel_to_meter_ratio = (user_height_m * ANATOMY_RATIO_HEAD_ANKLE) / median_pixels
-                scale_m_per_px = pixel_to_meter_ratio
-                body_height_px = median_pixels / ANATOMY_RATIO_HEAD_ANKLE
-                is_calibrated = True
-                logger.info(
-                    "动态解剖标定完成 (头踝法): height=%.0fcm, median_px=%.1f, pixel_to_meter_ratio=%.6f m/px",
-                    user_height_cm, median_pixels, pixel_to_meter_ratio,
-                )
-            elif len(calib_samples_tertiary) >= MIN_CALIB_SAMPLES * 2:
-                median_pixels = float(np.median(calib_samples_tertiary))
-                pixel_to_meter_ratio = (user_height_m * ANATOMY_RATIO_SHOULDER_HIP) / median_pixels
-                scale_m_per_px = pixel_to_meter_ratio
-                body_height_px = median_pixels / ANATOMY_RATIO_SHOULDER_HIP
-                is_calibrated = True
-                calibration_fallback = True
-                logger.warning(
-                    "动态解剖标定完成 (躯干兜底): height=%.0fcm, median_px=%.1f, pixel_to_meter_ratio=%.6f m/px",
-                    user_height_cm, median_pixels, pixel_to_meter_ratio,
-                )
-
-        if not is_calibrated:
-            if use_plate_calibration and len(plate_diameter_samples) > 0:
-                calib_count, calib_target = len(plate_diameter_samples), MIN_CALIB_SAMPLES
-                calib_method = "杠铃片"
-            elif not force_tertiary_calib and len(calib_samples_primary) > 0:
-                calib_count, calib_target = len(calib_samples_primary), MIN_CALIB_SAMPLES
-                calib_method = "肩踝法"
-            elif not force_tertiary_calib and len(calib_samples_secondary) > 0:
-                calib_count, calib_target = len(calib_samples_secondary), MIN_CALIB_SAMPLES
-                calib_method = "头踝法"
-            elif len(calib_samples_tertiary) > 0 or force_tertiary_calib:
-                calib_count, calib_target = len(calib_samples_tertiary), MIN_CALIB_SAMPLES * 2
-                calib_method = "肩髋法"
-            else:
-                calib_count, calib_target = 0, MIN_CALIB_SAMPLES
-                calib_method = "等待"
-
-            ankles_vis = max(la_conf, ra_conf)
-            shoulders_vis = max(conf5, conf6)
-            debug_str = f"Debug: Ankles_Vis: {ankles_vis:.2f} | Shoulders_Vis: {shoulders_vis:.2f} | Method: {calib_method}"
-            cv2.putText(frame_bgr, debug_str, (12, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1)
-
-            if calib_count == 0:
-                calib_text = "[ 🔍 正在寻找人体关键点... 请确保全身入镜 ]"
-            else:
-                calib_text = f"[ 🔄 标定中: {calib_count}/{calib_target} (正在使用 {calib_method}) ]"
-            cv2.putText(frame_bgr, calib_text, (w // 2 - 200, h // 2 - 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
-            stats = {
-                "reps": 0, "current_vel": 0.0, "best_vel": 0.0, "velocity_loss_pct": 0.0,
-                "phase": "CALIBRATING", "fps": fps, "latency_ms": (time.time() - frame_start) * 1000,
-                "rom_completion_pct": None, "pose_diag": None,
-            }
-            try:
-                _write_perf_stats(fps if fps > 0 else 0.0, (time.time() - frame_start) * 1000)
-            except Exception:
-                pass
-            yield frame_bgr, stats
-            continue
+            if not is_calibrated:
+                # ── HUD 进度提示 ──
+                prog = _calib.calib_progress
+                calib_count, calib_target = prog["count"], prog["target"]
+                calib_method_str = prog["method"]
+                ankles_vis_val = max(float(kps[15][2]) if len(kps) > 15 else 0.0,
+                                     float(kps[16][2]) if len(kps) > 16 else 0.0)
+                shoulders_vis_val = max(float(kps[5][2]) if len(kps) > 5 else 0.0,
+                                        float(kps[6][2]) if len(kps) > 6 else 0.0)
+                debug_str = f"Debug: Ankles_Vis: {ankles_vis_val:.2f} | Shoulders_Vis: {shoulders_vis_val:.2f} | Method: {calib_method_str}"
+                cv2.putText(frame_bgr, debug_str, (12, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1)
+                if calib_count == 0:
+                    calib_text = "[ 正在寻找人体关键点... 请确保全身入镜 ]"
+                else:
+                    calib_text = f"[ 标定中: {calib_count}/{calib_target} ({calib_method_str}) ]"
+                cv2.putText(frame_bgr, calib_text, (w // 2 - 200, h // 2 - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2)
+                stats = {
+                    "reps": 0, "current_vel": 0.0, "best_vel": 0.0, "velocity_loss_pct": 0.0,
+                    "phase": "CALIBRATING", "fps": fps, "latency_ms": (time.time() - frame_start) * 1000,
+                    "rom_completion_pct": None, "pose_diag": None,
+                }
+                try:
+                    _write_perf_stats(fps if fps > 0 else 0.0, (time.time() - frame_start) * 1000)
+                except Exception:
+                    pass
+                yield frame_bgr, stats
+                continue
 
         if y_hip is None or scale_m_per_px is None or body_height_px is None:
             phase_cn = "CALIBRATING" if y_hip is not None else "Waiting for pose"
@@ -985,8 +931,14 @@ def process_squat_video(
                 if tracked_x_raw is not None:
                     current_rep_x_coords.append(tracked_x_raw)
                 inst_v: Optional[float] = None
-                # dt 必须固定为 1/video_fps，严禁 time.time() - last_time
-                dt_video = 1.0 / video_fps
+                # dt: 摄像头用 monotonic 实测帧间隔（真实时间）；
+                # 视频文件用 1/video_fps（帧时间），两者严禁混用。
+                if is_camera and last_mono_time_prev is not None:
+                    dt_video = max(mono_now - last_mono_time_prev, MIN_DT_S)
+                    _timing_source = "monotonic"
+                else:
+                    dt_video = 1.0 / video_fps
+                    _timing_source = "video_fps"
                 if last_up_y is not None and scale_m_per_px is not None:
                     raw_dy_px = abs(smoothed_y - last_up_y)
                     inst_v = pixel_displacement_to_velocity_m_per_s(raw_dy_px, scale_m_per_px, dt_video)
@@ -1061,6 +1013,9 @@ def process_squat_video(
                                 depth_offset_cm, get_current_load_kg(), stored_loss, get_current_user_name(),
                                 rom_completion_pct, set_number, session_id, user_height_cm,
                                 rep_issue_tags,
+                                calib_method=_calib.method,
+                                calib_is_fallback=_calib.is_fallback,
+                                timing_source=_timing_source,
                             )
                     if set_rep_count == 1:
                         reference_max_displacement = abs(starting_height - y_lowest)

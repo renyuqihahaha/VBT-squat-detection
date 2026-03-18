@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+giut#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """VBT 实时引擎：MoveNet 骨骼绘制、VBT 疲劳判定、断点续存、非阻塞语音。"""
 

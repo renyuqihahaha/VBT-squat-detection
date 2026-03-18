@@ -65,6 +65,7 @@ class PhysicsConverter:
         Plane-to-Plane 深度偏移量（厘米）。
         公式：depth_offset = (Y_mid_hip - Y_mid_knee) × m_per_pixel × 100
         坐标系：OpenCV Y 向下，髋低于膝 → Y_hip > Y_knee → 正值表示达标。
+        注意：不再加入固定 BIAS_CM 偏置，避免隐藏系统误差。调用方如需补偿可自行处理。
         Args:
             mid_hip_y_px: 左右髋部中点 Y（像素）
             mid_knee_y_px: 左右膝盖中点 Y（像素）
@@ -79,7 +80,7 @@ class PhysicsConverter:
         depth_offset_cm = depth_offset_px * mp * 100
         if abs(depth_offset_cm) < PhysicsConverter.DEPTH_JITTER_THRESHOLD_CM:
             depth_offset_cm = 0.0
-        return depth_offset_cm + PhysicsConverter.BIAS_CM
+        return depth_offset_cm
 
     def set_m_per_pixel(self, value):
         """设置并缓存 m_per_pixel。"""

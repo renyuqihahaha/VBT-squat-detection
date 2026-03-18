@@ -176,6 +176,19 @@ def _apply_dark_theme() -> None:
     )
 
 
+def _fmt_float(value, digits: int = 2, na: str = "N/A") -> str:
+    """
+    安全格式化浮点数，0.0 显示为 '0.00'（而非 'N/A'）。
+    None 或非数字类型 -> na 字符串。
+    """
+    if value is None:
+        return na
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return na
+
+
 def _render_dual_mode_sidebar() -> tuple[str, int, float]:
     """侧边栏：双模路由与运行配置。"""
     st.sidebar.subheader("工作模式")
@@ -620,6 +633,26 @@ def _render_mode_a_realtime() -> None:
             sc2.metric("最佳均速", f"{max(rep_velocities):.3f} m/s")
             avg_rom = sum(rep_rom_completions) / len(rep_rom_completions) if rep_rom_completions else 0.0
             sc3.metric("平均 ROM", f"{avg_rom:.1f}%")
+
+            # ── Finalize set: persist set summary + AI prediction log ──
+            # Guard: only finalize once per set (debounce via session_state key)
+            _fin_key = f"_finalized_set_{rt_session}_{rt_set}"
+            if not st.session_state.get(_fin_key, False):
+                try:
+                    from vbt_cv_engine import _finalize_set_from_velocities
+                    from vbt_analytics_pro import DB_PATH as _db
+                    _finalize_set_from_velocities(
+                        session_id=rt_session,
+                        set_number=rt_set,
+                        user_name=get_current_user_name(),
+                        rep_velocities=list(rep_velocities),
+                        db_path=_db,
+                        load_kg=get_current_load_kg(),
+                    )
+                    st.session_state[_fin_key] = True
+                    logger.info("Realtime set %d finalized (session=%s)", rt_set, rt_session)
+                except Exception as _fe:
+                    logger.warning("Realtime finalize failed: %s", _fe)
 
             next_set = rt_set + 1
             st.info(f"第 {rt_set} 组采集完成！准备好第 {next_set} 组了吗？")
@@ -1865,6 +1898,7 @@ def render_streamlit_dashboard() -> None:
     mode, user_name, load_kg = _render_dual_mode_sidebar()
 
     _render_ai_coach_section(user_name, load_kg)
+    _render_training_mode_card()
 
     if mode == "实时采集 (树莓派)":
         _render_mode_a_realtime()
@@ -1885,6 +1919,214 @@ def main() -> None:
     if "realtime_running" not in st.session_state:
         st.session_state["realtime_running"] = False
     render_streamlit_dashboard()
+
+
+# ══════════════════════════════════════════════════════════════
+# Phase A/B Dashboard additions
+# ══════════════════════════════════════════════════════════════
+
+def _render_training_mode_card() -> None:
+    """Show current training mode policy card + set timeline + AI outputs."""
+    if st is None:
+        return
+    try:
+        from vbt_training_modes import MODE_POLICIES, get_mode_policy
+        from vbt_dl_models import get_inference
+    except ImportError as e:
+        st.warning(f"训练模式模块加载失败: {e}")
+        return
+
+    st.markdown("---")
+    st.subheader("🏋️ 训练模式 & AI 决策中心")
+
+    # ── Mode selector ─────────────────────────────────────────
+    col_mode, col_info = st.columns([1, 3])
+    with col_mode:
+        selected_mode = st.selectbox(
+            "训练目标模式",
+            list(MODE_POLICIES.keys()),
+            index=1,  # default: Strength
+            key="training_mode_select",
+        )
+    policy = get_mode_policy(selected_mode)
+    with col_info:
+        st.markdown(
+            f"""
+            **{policy.name}** — {policy.description}  
+            速度区间: `{policy.velocity_range_lo:.2f}–{policy.velocity_range_hi:.2f} m/s` &nbsp;|
+            停组阈值: `{policy.velocity_loss_stop_pct:.0f}%` &nbsp;|
+            推荐 reps: `{policy.rep_range_lo}–{policy.rep_range_hi}` &nbsp;|
+            组间休息: `{policy.rest_interval_s}s` &nbsp;|
+            加重幅度: `±{policy.load_step_kg:.1f} kg`
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ── Set-by-set recommendation timeline ───────────────────
+    db = DB_PATH
+    if not os.path.exists(db):
+        st.info("暂无训练数据")
+        return
+
+    try:
+        conn = sqlite3.connect(db)
+        from vbt_analytics_pro import _ensure_ml_schema, _enable_wal
+        _enable_wal(conn)
+        _ensure_ml_schema(conn)
+        sets_df = pd.read_sql_query(
+            """
+            SELECT set_number, load_kg, reps, best_velocity, mean_velocity,
+                   velocity_loss_pct, trusted_rep_count, untrusted_rep_count,
+                   quality_reasons, load_recommendation, recommendation_reason,
+                   was_stopped_by_policy, started_at
+            FROM sets
+            ORDER BY started_at DESC
+            LIMIT 20
+            """,
+            conn,
+        )
+        pred_df = pd.read_sql_query(
+            """
+            SELECT ts, model_name, model_version, fatigue_risk, stop_probability,
+                   technique_anomaly, confidence, used_model, recommendation,
+                   recommendation_reason
+            FROM prediction_logs
+            ORDER BY ts DESC
+            LIMIT 10
+            """,
+            conn,
+        )
+        conn.close()
+    except Exception as _qe:
+        logger.warning("AI center query failed: %s", _qe)
+        sets_df = pd.DataFrame()
+        pred_df = pd.DataFrame()
+
+    col_sets, col_ai = st.columns([3, 2])
+
+    with col_sets:
+        st.markdown("**组间推荐时间线**")
+        if sets_df.empty:
+            st.info("暂无组级数据 — 完成一次视频分析或实时训练后自动生成。"
+                    "\n\n提示: 运行 `python3 scripts/backfill_ai_center.py` 可从历史数据回填。")
+        else:
+            for _, row in sets_df.iterrows():
+                action = row.get("load_recommendation") or "maintain"
+                action_color = {
+                    "increase": "🟢", "maintain": "🟡",
+                    "decrease": "🟠", "stop": "🔴",
+                }.get(str(action), "⚪")
+                trust_pct = 0
+                total_r = (row.get("trusted_rep_count") or 0) + (row.get("untrusted_rep_count") or 0)
+                if total_r > 0:
+                    trust_pct = int((row.get("trusted_rep_count") or 0) / total_r * 100)
+                st.markdown(
+                    f"{action_color} **Set {int(row.get('set_number',0))}** &nbsp;|"
+                    f" {row.get('reps',0)} reps @ {row.get('load_kg',0):.1f}kg &nbsp;|"
+                    f" Best: {row.get('best_velocity',0):.3f} m/s &nbsp;|"
+                    f" Loss: {row.get('velocity_loss_pct',0):.1f}% &nbsp;|"
+                    f" Trust: {trust_pct}% &nbsp;|"
+                    f" → **{action}**",
+                    unsafe_allow_html=True,
+                )
+                reason = row.get("recommendation_reason") or ""
+                if reason:
+                    st.caption(f"  ↳ {reason}")
+                qr = row.get("quality_reasons") or ""
+                if qr:
+                    st.caption(f"  ⚠️ Quality issues: {qr}")
+
+    with col_ai:
+        st.markdown("**AI 输出 & 模型状态**")
+        try:
+            from vbt_model_registry import resolve_ai_models, FATIGUE_MODEL_NAME, TECHNIQUE_MODEL_NAME
+            _model_statuses = resolve_ai_models(db)
+            fat_st = _model_statuses.get(FATIGUE_MODEL_NAME)
+            tech_st = _model_statuses.get(TECHNIQUE_MODEL_NAME)
+
+            for _ms in [fat_st, tech_st]:
+                if _ms is None:
+                    continue
+                # Check for bootstrap tier from registry metadata
+                _tier_note = ""
+                try:
+                    import json as _json
+                    from vbt_model_registry import get_active_model
+                    _active = get_active_model(db, _ms.model_name)
+                    if _active and _ms.load_status == "loaded":
+                        _notes_row = sqlite3.connect(db).execute(
+                            "SELECT notes FROM ml_models WHERE model_name=? AND version=? LIMIT 1",
+                            (_ms.model_name, _ms.model_version)
+                        ).fetchone()
+                        if _notes_row and "bootstrap" in (_notes_row[0] or ""):
+                            _tier_note = " `⚠️bootstrap`"
+                except Exception:
+                    pass
+                st.markdown(
+                    f"{_ms.status_icon} **{_ms.model_name}** &nbsp;|&nbsp; "
+                    f"`{_ms.load_status}`{_tier_note} &nbsp;|&nbsp; {_ms.reason_text} &nbsp;|&nbsp; "
+                    f"v`{_ms.model_version}`",
+                    unsafe_allow_html=True,
+                )
+
+            # Fallback counts from inference wrapper
+            try:
+                from vbt_dl_models import get_inference
+                _inf = get_inference()
+                _fs = _inf.fallback_stats()
+                st.caption(
+                    f"疲劳回退次数: {_fs['fatigue_fallback_count']} &nbsp;|&nbsp; "
+                    f"技术回退次数: {_fs['technique_fallback_count']}",
+                    unsafe_allow_html=True,
+                )
+            except Exception:
+                pass
+
+            # Diagnostic expander
+            with st.expander("🔍 模型诊断", expanded=False):
+                for _ms in [fat_st, tech_st]:
+                    if _ms is None:
+                        continue
+                    st.markdown(f"**{_ms.model_name}**")
+                    st.markdown(f"- 期望路径: `{_ms.expected_path}`")
+                    st.markdown(f"- 文件存在: `{_ms.exists}`")
+                    st.markdown(f"- 来源: {'DB Registry' if _ms.from_registry else '默认路径'}")
+                    if _ms.load_error:
+                        st.error(f"加载错误: {_ms.load_error}")
+                    if _ms.load_status != "loaded":
+                        st.info(
+                            f"修复命令:\n```bash\n{_ms.train_command}\n```",
+                            icon="💡",
+                        )
+                    st.divider()
+                st.caption(
+                    "如果模型文件已存在但未注册，运行:\n"
+                    "`python3 scripts/repair_model_registry.py`"
+                )
+
+        except Exception as e:
+            st.warning(f"AI 模块状态读取失败: {e}")
+
+        if not pred_df.empty:
+            st.markdown("**最近预测记录**")
+            latest = pred_df.iloc[0]
+            fat_r = latest.get("fatigue_risk")
+            stop_p = latest.get("stop_probability")
+            tech_a = latest.get("technique_anomaly")
+            conf = latest.get("confidence")
+            mv = latest.get("model_version") or "rule_fallback"
+            used = bool(latest.get("used_model", 0))
+            col_f, col_s, col_t = st.columns(3)
+            col_f.metric("疲劳风险", f"{fat_r:.0%}" if fat_r is not None else "N/A")
+            col_s.metric("停组概率", f"{stop_p:.0%}" if stop_p is not None else "N/A")
+            col_t.metric("动作异常", f"{tech_a:.2f}" if tech_a is not None else "N/A")
+            st.caption(f"模型版本: {mv} | 置信度: {_fmt_float(conf, 2)} | DL: {'是' if used else '否(规则)'}")
+            rec = latest.get("recommendation") or ""
+            rec_reason = latest.get("recommendation_reason") or ""
+            if rec:
+                st.info(f"**推荐: {rec}** — {rec_reason}")
+        else:
+            st.info("暂无 AI 预测记录 — 完成一次视频分析后自动写入。")
 
 
 if __name__ == "__main__":
