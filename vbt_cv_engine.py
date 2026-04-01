@@ -721,6 +721,12 @@ def process_squat_video(
                         "phase": phase_cn,
                         "fps": fps,
                         "rom_completion_pct": last_completed_rom_pct if last_completed_rom_pct is not None else rom_completion_pct,
+                        # ── 标定诊断字段（即使在 video_ended 帧也保留）──
+                        "calib_scale_m_per_px": scale_m_per_px,
+                        "calib_body_height_px": body_height_px,
+                        "calib_method_used": _calib.method if is_calibrated else None,
+                        "calib_is_fallback": calibration_fallback,
+                        "rep_velocities": list(rep_velocities_in_set),
                     }
                 break
         if frame_bgr is None or frame_bgr.size == 0:
@@ -842,6 +848,8 @@ def process_squat_video(
                     "reps": 0, "current_vel": 0.0, "best_vel": 0.0, "velocity_loss_pct": 0.0,
                     "phase": "CALIBRATING", "fps": fps, "latency_ms": (time.time() - frame_start) * 1000,
                     "rom_completion_pct": None, "pose_diag": None,
+                    "calib_scale_m_per_px": None, "calib_body_height_px": None,
+                    "calib_method_used": None, "calib_is_fallback": False,
                 }
                 try:
                     _write_perf_stats(fps if fps > 0 else 0.0, (time.time() - frame_start) * 1000)
@@ -1099,6 +1107,11 @@ def process_squat_video(
                 "score": last_pose_diag.score,
             } if pose_diag_enabled else None,
             "rep_velocities": list(rep_velocities_in_set),
+            # ── 标定诊断字段（只读，供实验验证模块使用，不影响主看板）──
+            "calib_scale_m_per_px": scale_m_per_px,
+            "calib_body_height_px": body_height_px,
+            "calib_method_used": _calib.method if is_calibrated else None,
+            "calib_is_fallback": calibration_fallback,
         }
         yield frame_bgr, stats
 

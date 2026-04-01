@@ -327,17 +327,6 @@ def _render_dual_mode_sidebar() -> tuple[str, int, float]:
     st.session_state["use_plate_calibration"] = st.session_state.get("sidebar_plate_calib", False)
 
     st.sidebar.markdown("---")
-    st.sidebar.subheader("AI 训练模式")
-    training_goal_ui = st.sidebar.selectbox(
-        "训练目标（影响疲劳阈值）",
-        options=["Strength", "Hypertrophy", "Power"],
-        index=0,
-        format_func=lambda x: {"Strength": "最大力量 (Strength)", "Hypertrophy": "肌肥大 (Hypertrophy)", "Power": "爆发力 (Power)"}[x],
-        key="training_goal_select",
-    )
-    training_mode = "hypertrophy" if training_goal_ui == "Hypertrophy" else "strength"
-    thresh_pct = "15%" if training_goal_ui == "Power" else "20%" if training_goal_ui == "Strength" else "35%"
-    st.sidebar.caption(f"当前目标: **{training_goal_ui}** | 流失阈值: **{thresh_pct}**")
 
     # ── 边缘计算引擎状态（唯一实例，st.empty 占位符，循环内同步更新）──
     st.sidebar.divider()
@@ -1948,6 +1937,9 @@ def _render_training_mode_card() -> None:
             index=1,  # default: Strength
             key="training_mode_select",
         )
+    # 统一训练模式状态源：仅主页面右侧 training_mode_select
+    st.session_state["ai_mode_toggle"] = (selected_mode == "Hypertrophy")
+    st.session_state["training_goal_select"] = selected_mode
     policy = get_mode_policy(selected_mode)
     with col_info:
         st.markdown(
@@ -2005,36 +1997,36 @@ def _render_training_mode_card() -> None:
     col_sets, col_ai = st.columns([3, 2])
 
     with col_sets:
-        st.markdown("**组间推荐时间线**")
-        if sets_df.empty:
-            st.info("暂无组级数据 — 完成一次视频分析或实时训练后自动生成。"
-                    "\n\n提示: 运行 `python3 scripts/backfill_ai_center.py` 可从历史数据回填。")
-        else:
-            for _, row in sets_df.iterrows():
-                action = row.get("load_recommendation") or "maintain"
-                action_color = {
-                    "increase": "🟢", "maintain": "🟡",
-                    "decrease": "🟠", "stop": "🔴",
-                }.get(str(action), "⚪")
-                trust_pct = 0
-                total_r = (row.get("trusted_rep_count") or 0) + (row.get("untrusted_rep_count") or 0)
-                if total_r > 0:
-                    trust_pct = int((row.get("trusted_rep_count") or 0) / total_r * 100)
-                st.markdown(
-                    f"{action_color} **Set {int(row.get('set_number',0))}** &nbsp;|"
-                    f" {row.get('reps',0)} reps @ {row.get('load_kg',0):.1f}kg &nbsp;|"
-                    f" Best: {row.get('best_velocity',0):.3f} m/s &nbsp;|"
-                    f" Loss: {row.get('velocity_loss_pct',0):.1f}% &nbsp;|"
-                    f" Trust: {trust_pct}% &nbsp;|"
-                    f" → **{action}**",
-                    unsafe_allow_html=True,
-                )
-                reason = row.get("recommendation_reason") or ""
-                if reason:
-                    st.caption(f"  ↳ {reason}")
-                qr = row.get("quality_reasons") or ""
-                if qr:
-                    st.caption(f"  ⚠️ Quality issues: {qr}")
+        with st.expander("组间推荐时间线", expanded=False):
+            if sets_df.empty:
+                st.info("暂无组级数据 — 完成一次视频分析或实时训练后自动生成。"
+                        "\n\n提示: 运行 `python3 scripts/backfill_ai_center.py` 可从历史数据回填。")
+            else:
+                for _, row in sets_df.iterrows():
+                    action = row.get("load_recommendation") or "maintain"
+                    action_color = {
+                        "increase": "🟢", "maintain": "🟡",
+                        "decrease": "🟠", "stop": "🔴",
+                    }.get(str(action), "⚪")
+                    trust_pct = 0
+                    total_r = (row.get("trusted_rep_count") or 0) + (row.get("untrusted_rep_count") or 0)
+                    if total_r > 0:
+                        trust_pct = int((row.get("trusted_rep_count") or 0) / total_r * 100)
+                    st.markdown(
+                        f"{action_color} **Set {int(row.get('set_number',0))}** &nbsp;|"
+                        f" {row.get('reps',0)} reps @ {row.get('load_kg',0):.1f}kg &nbsp;|"
+                        f" Best: {row.get('best_velocity',0):.3f} m/s &nbsp;|"
+                        f" Loss: {row.get('velocity_loss_pct',0):.1f}% &nbsp;|"
+                        f" Trust: {trust_pct}% &nbsp;|"
+                        f" → **{action}**",
+                        unsafe_allow_html=True,
+                    )
+                    reason = row.get("recommendation_reason") or ""
+                    if reason:
+                        st.caption(f"  ↳ {reason}")
+                    qr = row.get("quality_reasons") or ""
+                    if qr:
+                        st.caption(f"  ⚠️ Quality issues: {qr}")
 
     with col_ai:
         st.markdown("**AI 输出 & 模型状态**")
