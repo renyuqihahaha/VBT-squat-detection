@@ -846,8 +846,6 @@ def process_squat_video_realtime_light(
                 "depth_offset_cm": stats.get("depth_offset_cm"),
                 "is_realtime": True,
                 "rep_buffer_size": int(stats.get("rep_buffer_size", 0) or 0),
-                "frame_id": stats.get("frame_id"),
-                "is_demo_mode": bool(stats.get("is_demo_mode", REALTIME_LOWLOAD_MODE)),
                 "error": None,
                 "recording_path": stats.get("recording_path"),
                 "calibration_fallback": stats.get("calibration_fallback", False),
@@ -1646,8 +1644,6 @@ def process_squat_video(
                 "rep_buffer_size": len(realtime_rep_buffer),
                 "recording_path": recording_path,
                 "ui_mode": "compact",
-                "frame_id": frame_n,
-                "is_demo_mode": bool(REALTIME_LOWLOAD_MODE),
                 "error": None,
             }
             _rt_trace(frame_n, set_rep_count, "before_yield")

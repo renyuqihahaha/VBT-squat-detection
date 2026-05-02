@@ -7,7 +7,6 @@ VBT Command Center 核心 CV 引擎：统一 process_squat_video(video_source)�
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import queue
@@ -91,24 +90,6 @@ CAMERA_CONSECUTIVE_OK = 3
 INFER_EVERY_N_FRAMES = 2
 VIDEO_WRITE_QUEUE_SIZE = 30
 PERF_LOG_INTERVAL_S = 1.0
-
-# Realtime low-load switches (camera mode only)
-REALTIME_LOWLOAD_MODE = True
-REALTIME_TARGET_FPS = 8
-REALTIME_MAX_FPS = 10
-REALTIME_INFER_EVERY = 3
-REALTIME_HUD_EVERY = 2
-REALTIME_YIELD_EVERY = 1
-REALTIME_RESIZE_WIDTH = 640
-REALTIME_DISABLE_FANCY_HUD = True
-REALTIME_DISABLE_NONCRITICAL_METRICS = True
-REALTIME_DISABLE_DEPTH_METRICS = True
-REALTIME_DISABLE_BAR_PATH_TRACK = True
-REALTIME_DISABLE_REP_DB_DURING_LOOP = True
-REALTIME_DISABLE_REPORT_DURING_LOOP = True
-REALTIME_DISABLE_DEPTH_HARD_FAIL = True
-REALTIME_VIDEO_WRITE_EVERY = 3
-REALTIME_VIDEO_WRITE_QUEUE_WARN = 10
 DEBUG_RT_TRACE = os.getenv("VBT_DEBUG_RT_TRACE", "0") == "1"
 logger = logging.getLogger("vbt_cv_engine")
 
@@ -196,7 +177,6 @@ class VideoWriterWorker:
         self._thread = threading.Thread(target=self._run, daemon=True, name="vbt-video-writer")
         self.dropped_frames = 0
         self.written_frames = 0
-        self.last_drop_log_ts = 0.0
         self._thread.start()
 
     def submit(self, frame: np.ndarray) -> bool:
@@ -209,12 +189,6 @@ class VideoWriterWorker:
         except queue.Full:
             self.dropped_frames += 1
             return False
-
-    def qsize(self) -> int:
-        try:
-            return int(self._queue.qsize())
-        except Exception:
-            return -1
 
     def _run(self) -> None:
         while not self._stop_event.is_set() or not self._queue.empty():
@@ -529,78 +503,6 @@ def _insert_rep_async(
         logger.warning("rep 写入入队失败: %s", e)
 
 
-def flush_realtime_rep_buffer(
-    realtime_rep_buffer: list[dict],
-    db_path: str = DB_PATH,
-    allow_db_insert: bool = False,
-) -> Optional[str]:
-    if not realtime_rep_buffer:
-        return None
-
-    saved_json_path: Optional[str] = None
-    try:
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
-        os.makedirs(results_dir, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        saved_json_path = os.path.join(results_dir, f"realtime_rep_buffer_{ts}.json")
-        with open(saved_json_path, "w", encoding="utf-8") as f:
-            json.dump(realtime_rep_buffer, f, ensure_ascii=False, indent=2)
-        logger.info("[REALTIME_REP_BUFFER_SAVED] path=%s count=%d", saved_json_path, len(realtime_rep_buffer))
-    except Exception as e:
-        logger.exception("[REALTIME_REP_BUFFER_SAVE_ERROR] err=%s", e)
-
-    if not allow_db_insert:
-        return saved_json_path
-
-    for item in realtime_rep_buffer:
-        try:
-            mcv = item.get("mcv")
-            rom_m = item.get("rom_m")
-            if mcv is None or rom_m is None:
-                continue
-            _insert_rep_async(
-                db_path,
-                int(item.get("rep") or 0),
-                float(mcv),
-                float(rom_m),
-                item.get("left_knee"),
-                item.get("right_knee"),
-                item.get("trunk"),
-                None,
-                item.get("depth_offset_cm"),
-                float(item.get("load_kg") or 0.0),
-                item.get("velocity_loss"),
-                str(item.get("user_name") or "Guest"),
-                item.get("rom_completion_pct"),
-                item.get("set_number"),
-                item.get("session_id"),
-                item.get("user_height_cm"),
-                item.get("pose_issues"),
-                calib_method=item.get("calib_method"),
-                calib_is_fallback=item.get("calib_is_fallback"),
-                timing_source=item.get("timing_source"),
-            )
-            logger.info("[REALTIME_REP_FLUSH_OK] rep=%s", item.get("rep"))
-        except Exception as e:
-            logger.exception("[REALTIME_REP_FLUSH_ERROR] rep=%s err=%s", item.get("rep"), e)
-
-    return saved_json_path
-
-
-def _render_minimal_hud(
-    frame_bgr: np.ndarray,
-    phase_cn: str,
-    set_rep_count: int,
-    fps: float,
-    inst_vel: Optional[float] = None,
-) -> None:
-    cv2.putText(frame_bgr, f"Reps: {set_rep_count}", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    cv2.putText(frame_bgr, f"Phase: {phase_cn}", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
-    cv2.putText(frame_bgr, f"FPS: {fps:.1f}", (12, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-    if inst_vel is not None:
-        cv2.putText(frame_bgr, f"Vel: {float(inst_vel):.2f} m/s", (12, 118), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-
 def _render_hud(
     frame_bgr: np.ndarray,
     phase_cn: str,
@@ -763,107 +665,6 @@ def _build_recording_filename(
     return f"{uname}_{height_cm:.0f}cm_{load_kg:.0f}kg_set{set_number}_{ts}.mp4"
 
 
-def process_squat_video_realtime_light(
-    video_source: Union[int, str],
-    stop_flag: Optional[threading.Event] = None,
-    set_number: Optional[int] = None,
-    session_id: Optional[str] = None,
-    user_height_cm: float = 175.0,
-    record_video: bool = False,
-    pose_diag_enabled: bool = True,
-    use_plate_calibration: bool = False,
-    plate_diameter_cm: Optional[float] = None,
-    is_bodyweight: bool = False,
-) -> Generator[tuple[np.ndarray, dict], None, None]:
-    """Realtime lightweight adapter.
-
-    - 优先保障不断流；
-    - 输出轻量 payload；
-    - 不在本函数中做 DB/finalize；
-    - 底层仍复用 process_squat_video 的稳定实时主循环与 stop 后 flush。
-    """
-    if not isinstance(video_source, int):
-        yield from process_squat_video(
-            video_source,
-            stop_flag=stop_flag,
-            set_number=set_number,
-            session_id=session_id,
-            user_height_cm=user_height_cm,
-            record_video=record_video,
-            pose_diag_enabled=pose_diag_enabled,
-            use_plate_calibration=use_plate_calibration,
-            plate_diameter_cm=plate_diameter_cm,
-            is_bodyweight=is_bodyweight,
-        )
-        return
-
-    base_gen = process_squat_video(
-        video_source,
-        stop_flag=stop_flag,
-        set_number=set_number,
-        session_id=session_id,
-        user_height_cm=user_height_cm,
-        record_video=record_video,
-        pose_diag_enabled=pose_diag_enabled,
-        use_plate_calibration=use_plate_calibration,
-        plate_diameter_cm=plate_diameter_cm,
-        is_bodyweight=is_bodyweight,
-    )
-
-    for item in base_gen:
-        try:
-            frame_bgr, stats = item
-        except Exception as e:
-            logger.exception("[REALTIME_FRAME_ERROR] frame=%s rep=%s err=%s", "na", "na", e)
-            continue
-
-        try:
-            reps = int(stats.get("reps", 0) or 0)
-            phase = str(stats.get("phase", "UNKNOWN"))
-            fps = float(stats.get("fps", 0.0) or 0.0)
-            latency_ms = float(stats.get("latency_ms", 0.0) or 0.0)
-
-            inst_velocity = stats.get("inst_velocity")
-            if inst_velocity is None:
-                inst_velocity = stats.get("current_vel", 0.0)
-
-            best_mean_velocity = stats.get("best_mean_velocity")
-            if best_mean_velocity is None:
-                best_mean_velocity = stats.get("best_vel", 0.0)
-
-            velocity_loss = stats.get("velocity_loss")
-            if velocity_loss is None:
-                velocity_loss = stats.get("velocity_loss_pct", 0.0)
-
-            light_stats = {
-                "reps": reps,
-                "phase": phase,
-                "fps": fps,
-                "latency_ms": latency_ms,
-                "inst_velocity": float(inst_velocity or 0.0),
-                "best_mean_velocity": float(best_mean_velocity or 0.0),
-                "velocity_loss": float(velocity_loss or 0.0),
-                "depth_offset_cm": stats.get("depth_offset_cm"),
-                "is_realtime": True,
-                "rep_buffer_size": int(stats.get("rep_buffer_size", 0) or 0),
-                "frame_id": stats.get("frame_id"),
-                "is_demo_mode": bool(stats.get("is_demo_mode", REALTIME_LOWLOAD_MODE)),
-                "error": None,
-                "recording_path": stats.get("recording_path"),
-                "calibration_fallback": stats.get("calibration_fallback", False),
-                "pose_diag": None,
-                "rom_completion_pct": stats.get("rom_completion_pct"),
-                "current_vel": float(inst_velocity or 0.0),
-                "best_vel": float(best_mean_velocity or 0.0),
-                "velocity_loss_pct": float(velocity_loss or 0.0),
-            }
-            yield frame_bgr, light_stats
-        except Exception as e:
-            logger.exception("[REALTIME_YIELD_ERROR] frame=%s rep=%s err=%s", "na", stats.get("reps", "na") if isinstance(stats, dict) else "na", e)
-            continue
-
-
-
 def process_squat_video(
     video_source: Union[int, str],
     stop_flag: Optional[threading.Event] = None,
@@ -885,15 +686,8 @@ def process_squat_video(
     is_bodyweight: 自重/徒手深蹲模式，锁定解剖标定并追踪髋部重心。
     stats 字典包含 'recording_path', 'pose_diag', 'rep_velocities' 键。
     """
+    ensure_db_safe(DB_PATH)
     is_camera = isinstance(video_source, int)
-    is_realtime_mode = bool(is_camera)
-    realtime_lowload = bool(is_realtime_mode and REALTIME_LOWLOAD_MODE)
-    realtime_rep_buffer: list[dict] = []
-    realtime_error_count = 0
-    last_heartbeat_ts = time.perf_counter()
-
-    if not is_camera:
-        ensure_db_safe(DB_PATH)
 
     if is_camera:
         cap = _open_camera_robust(int(video_source))
@@ -998,8 +792,6 @@ def process_squat_video(
     fps_n = 0
     fps = 0.0
     frame_n = 0
-    infer_count = 0
-    last_heartbeat_infer_count = 0
 
     video_writer: Optional[cv2.VideoWriter] = None
     video_writer_worker: Optional[VideoWriterWorker] = None
@@ -1024,17 +816,13 @@ def process_squat_video(
             recording_path = None
 
     last_perf_log_ts = time.perf_counter()
-    infer_every_n = REALTIME_INFER_EVERY if realtime_lowload else INFER_EVERY_N_FRAMES
-    frame_interval_s = (1.0 / REALTIME_MAX_FPS) if (realtime_lowload and REALTIME_MAX_FPS > 0) else 0.0
-    last_frame_emit_ts = 0.0
     perf_ema_ms: dict[str, Optional[float]] = {
-        "cap": None,
-        "infer": None,
-        "rep": None,
-        "hud": None,
-        "yield": None,
-        "writer": None,
-        "loop": None,
+        "camera_read": None,
+        "pose_infer": None,
+        "rep_count": None,
+        "video_write": None,
+        "ui_update": None,
+        "loop_total": None,
     }
     last_kps = None
     last_kps_shape: tuple[int, int] = (0, 0)
@@ -1103,11 +891,6 @@ def process_squat_video(
                 break
         if frame_bgr is None or frame_bgr.size == 0:
             continue
-        if realtime_lowload and REALTIME_RESIZE_WIDTH > 0:
-            src_h, src_w = frame_bgr.shape[:2]
-            if src_w > REALTIME_RESIZE_WIDTH:
-                dst_h = max(1, int(src_h * REALTIME_RESIZE_WIDTH / src_w))
-                frame_bgr = cv2.resize(frame_bgr, (REALTIME_RESIZE_WIDTH, dst_h), interpolation=cv2.INTER_AREA)
         _rt_trace(frame_n, set_rep_count, "after_cap_read")
         camera_read_ms = (time.perf_counter() - camera_t0) * 1000.0
 
@@ -1130,22 +913,8 @@ def process_squat_video(
 
         _rt_trace(frame_n, set_rep_count, "before_video_submit")
         video_write_t0 = time.perf_counter()
-        if video_writer_worker is not None and (not realtime_lowload or frame_n % max(1, REALTIME_VIDEO_WRITE_EVERY) == 0):
-            try:
-                submitted = video_writer_worker.submit(frame_bgr)
-                if not submitted:
-                    realtime_error_count += 1
-                qsize = video_writer_worker.qsize()
-                if (not submitted or qsize >= REALTIME_VIDEO_WRITE_QUEUE_WARN) and (time.perf_counter() - video_writer_worker.last_drop_log_ts) >= 1.0:
-                    logger.warning(
-                        "[REALTIME_VIDEO_WRITE_DROP] queue=%s dropped=%s",
-                        qsize,
-                        video_writer_worker.dropped_frames,
-                    )
-                    video_writer_worker.last_drop_log_ts = time.perf_counter()
-            except Exception as e:
-                realtime_error_count += 1
-                logger.exception("[REALTIME_VIDEO_WRITE_DROP] queue=err dropped=%s err=%s", video_writer_worker.dropped_frames, e)
+        if video_writer_worker is not None:
+            video_writer_worker.submit(frame_bgr)
         video_write_ms = (time.perf_counter() - video_write_t0) * 1000.0
         _rt_trace(frame_n, set_rep_count, "after_video_submit")
 
@@ -1153,11 +922,10 @@ def process_squat_video(
         infer_t0 = time.perf_counter()
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         h, w = frame_rgb.shape[:2]
-        run_inference = (last_kps is None) or (frame_n % max(1, infer_every_n) == 0)
+        run_inference = (last_kps is None) or (frame_n % max(1, INFER_EVERY_N_FRAMES) == 0)
         kps = last_kps
         if run_inference:
             try:
-                infer_count += 1
                 padded, offset_x, offset_y, scale, _ = _letterbox_preprocess(frame_rgb, MODEL_INPUT_SIZE)
                 inp = np.expand_dims(padded, axis=0).astype(np.uint8)
                 interpreter.set_tensor(input_details[0]["index"], inp)
@@ -1177,8 +945,7 @@ def process_squat_video(
         pose_infer_ms = (time.perf_counter() - infer_t0) * 1000.0
         _rt_trace(frame_n, set_rep_count, "after_pose_infer")
 
-        if not realtime_lowload:
-            _draw_skeleton(frame_bgr, kps, h, w, pixel_coords=True, conf_thresh=0.3, color=(0, 255, 0), thickness=2)
+        _draw_skeleton(frame_bgr, kps, h, w, pixel_coords=True, conf_thresh=0.3, color=(0, 255, 0), thickness=2)
 
         _rt_trace(frame_n, set_rep_count, "before_rep_update")
         rep_t0 = time.perf_counter()
@@ -1324,15 +1091,14 @@ def process_squat_video(
 
             mid_hip_x = (float(l_hip[1]) + float(r_hip[1])) / 2.0 if l_hip is not None and r_hip is not None else w // 2
             mid_hip_y = (float(l_hip[0]) + float(r_hip[0])) / 2.0 if l_hip is not None and r_hip is not None else h // 2
-            if not realtime_lowload:
-                trajectory.append((mid_hip_x, mid_hip_y))
-                hip_x_history.append(mid_hip_x)
-            if not REALTIME_DISABLE_BAR_PATH_TRACK and tracked_x_raw is not None and tracked_y_raw is not None:
+            trajectory.append((mid_hip_x, mid_hip_y))
+            hip_x_history.append(mid_hip_x)
+            if tracked_x_raw is not None and tracked_y_raw is not None:
                 px, py = int(tracked_x_raw), int(tracked_y_raw)
                 if 0 <= px < w and 0 <= py < h:
                     bar_path_buffer.append((px, py))
 
-            if pose_diag_enabled and not realtime_lowload and frame_n % 3 == 0:
+            if pose_diag_enabled and frame_n % 3 == 0:
                 body_w_px = body_height_px * 0.35 if body_height_px else float(w) * 0.2
                 last_pose_diag = diagnose_pose(kps, w, hip_x_history, body_w_px, state)
                 if last_pose_diag.issues:
@@ -1340,10 +1106,7 @@ def process_squat_video(
 
             mid_hip_y_val = (float(l_hip[0]) + float(r_hip[0])) / 2.0 if l_hip is not None and r_hip is not None else None
             mid_knee_y = (float(l_knee[0]) + float(r_knee[0])) / 2.0 if l_knee is not None and r_knee is not None else None
-            if realtime_lowload and REALTIME_DISABLE_DEPTH_METRICS:
-                depth_offset_cm = None
-            else:
-                depth_offset_cm = get_depth_offset(mid_hip_y_val, mid_knee_y, scale_m_per_px)
+            depth_offset_cm = get_depth_offset(mid_hip_y_val, mid_knee_y, scale_m_per_px)
 
             if state == "STANDING":
                 running_avg_y = smoothed_y if running_avg_y is None else 0.97 * running_avg_y + 0.03 * smoothed_y
@@ -1374,7 +1137,7 @@ def process_squat_video(
                     prev_inst_v = None
 
             if state == "UP":
-                if not realtime_lowload and (time.perf_counter() - last_depth_state_log_ts) >= DEPTH_STATE_LOG_INTERVAL_S:
+                if (time.perf_counter() - last_depth_state_log_ts) >= DEPTH_STATE_LOG_INTERVAL_S:
                     pixel_delta_dbg = abs(float(y_bottom) - float(smoothed_y)) if (y_bottom is not None and y_bottom > 0 and smoothed_y is not None) else None
                     logger.info(
                         "[DEPTH_STATE] frame=%d rep=%d phase=%s m_per_px=%s depth=%s pixel_delta=%s invalid_depth_count=%d locked=%s",
@@ -1389,7 +1152,7 @@ def process_squat_video(
                     )
                     last_depth_state_log_ts = time.perf_counter()
                 # 仅 UP 阶段收集 X 坐标，用于 Path Shift
-                if tracked_x_raw is not None and not realtime_lowload:
+                if tracked_x_raw is not None:
                     current_rep_x_coords.append(tracked_x_raw)
                 inst_v: Optional[float] = None
                 # dt: 摄像头用 monotonic 实测帧间隔（真实时间）；
@@ -1431,135 +1194,124 @@ def process_squat_video(
                 frames_in_buffer = frames_in_buffer + 1 if in_buffer else 0
                 rep_done = early_finish or (frames_in_buffer >= FRAMES_IN_BUFFER_TO_END)
                 if rep_done:
-                    metric_depth_m: Optional[float] = None
-                    metric_mcv: Optional[float] = None
-                    rep_peak_vel = float(max(ascent_samples)) if ascent_samples else 0.0
-
                     # 向心时间必须用帧数/视频帧率，严禁 time.time()
                     concentric_frames = frame_n - start_asc_frame_index if start_asc_frame_index >= 0 else 0
-                    concentric_time = concentric_frames / video_fps if video_fps > 0 else 0.0
+                    concentric_time = concentric_frames / video_fps
                     if concentric_time <= 0:
                         concentric_time = 0.001
-
-                    if (not realtime_lowload or not REALTIME_DISABLE_DEPTH_METRICS) and concentric_time > 0.05 and y_bottom > 0:
-                        try:
-                            bottom_y_px = y_bottom
-                            top_y_px = smoothed_y
-                            depth_meters, depth_err, pixel_delta = safe_compute_depth(
-                                top_y_px,
-                                bottom_y_px,
-                                scale_m_per_px,
-                                last_valid_depth_m=last_valid_depth_m,
-                            )
-                            if depth_err is not None:
-                                invalid_depth_count += 1
-                                now_guard = time.perf_counter()
-                                if (now_guard - last_depth_guard_log_ts) >= DEPTH_GUARD_LOG_INTERVAL_S:
-                                    logger.warning(
-                                        "[DEPTH_GUARD] frame=%d rep=%d err=%s last_valid=%s",
-                                        frame_n,
-                                        set_rep_count,
-                                        depth_err,
-                                        f"{last_valid_depth_m:.3f}" if last_valid_depth_m is not None else "None",
-                                    )
-                                    last_depth_guard_log_ts = now_guard
-                            else:
-                                invalid_depth_count = 0
-                                last_valid_depth_m = depth_meters
-                                metric_depth_m = depth_meters
-                                if depth_meters is not None:
-                                    metric_mcv = depth_meters / concentric_time
-                        except Exception as e:
-                            realtime_error_count += 1
-                            logger.exception("[REALTIME_REP_METRIC_ERROR] rep=%s err=%s", set_rep_count + 1, e)
-
-                    set_rep_count += 1
-
-                    if metric_mcv is not None:
-                        current_rep_velocity = float(metric_mcv)
-                        rep_velocities_in_set.append(float(metric_mcv))
-                        best_velocity_in_set = max(rep_velocities_in_set)
-                        if set_rep_count == 1:
-                            current_v_loss = 0.0
-                            stored_loss = None
-                        else:
-                            loss_rate = (best_velocity_in_set - metric_mcv) / best_velocity_in_set if best_velocity_in_set > 0 else 0.0
-                            current_v_loss = loss_rate * 100.0
-                            stored_loss = current_v_loss
-                    else:
-                        stored_loss = current_v_loss if set_rep_count > 1 else None
-
-                    last_rep_peak_vel = rep_peak_vel
-
-                    if not realtime_lowload and len(current_rep_x_coords) > 0 and scale_m_per_px is not None:
-                        try:
-                            shift_px = max(current_rep_x_coords) - min(current_rep_x_coords)
-                            last_bar_shift_cm = shift_px * scale_m_per_px * 100.0
-                        except Exception as e:
-                            realtime_error_count += 1
-                            logger.exception("[REALTIME_REP_METRIC_ERROR] rep=%s err=%s", set_rep_count, e)
-
-                    rep_issue_tags = None
-                    if not realtime_lowload:
-                        rep_issue_tags = ",".join(sorted(set(accumulated_pose_issues))) if accumulated_pose_issues else None
-                    accumulated_pose_issues.clear()
-
-                    if realtime_lowload and REALTIME_DISABLE_NONCRITICAL_METRICS:
-                        metrics_status = "partial" if metric_mcv is not None else "none"
-                        realtime_rep_buffer.append({
-                            "rep": int(set_rep_count),
-                            "mcv": float(metric_mcv) if metric_mcv is not None else None,
-                            "rom_m": float(metric_depth_m) if metric_depth_m is not None else None,
-                            "depth_offset_cm": None,
-                            "velocity_loss": float(stored_loss) if stored_loss is not None else None,
-                            "timestamp": time.time(),
-                            "set_number": set_number,
-                            "session_id": session_id,
-                            "user_height_cm": float(user_height_cm) if user_height_cm is not None else None,
-                        })
-                    else:
-                        metrics_status = "ok" if metric_mcv is not None and metric_depth_m is not None else ("partial" if metric_mcv is not None or metric_depth_m is not None else "none")
-                        try:
-                            realtime_rep_buffer.append({
-                                "rep": int(set_rep_count),
-                                "mcv": float(metric_mcv) if metric_mcv is not None else None,
-                                "rom_m": float(metric_depth_m) if metric_depth_m is not None else None,
-                                "depth_offset_cm": float(depth_offset_cm) if depth_offset_cm is not None else None,
-                                "velocity_loss": float(stored_loss) if stored_loss is not None else None,
-                                "form_score": float(last_pose_diag.score) if getattr(last_pose_diag, "score", None) is not None else None,
-                                "bar_shift_cm": float(last_bar_shift_cm) if last_bar_shift_cm is not None else None,
-                                "timestamp": time.time(),
-                                "left_knee": float(lk) if lk is not None else None,
-                                "right_knee": float(rk) if rk is not None else None,
-                                "trunk": float(tr) if tr is not None else None,
-                                "rom_completion_pct": float(rom_completion_pct) if rom_completion_pct is not None else None,
-                                "set_number": set_number,
-                                "session_id": session_id,
-                                "user_height_cm": float(user_height_cm) if user_height_cm is not None else None,
-                                "pose_issues": rep_issue_tags,
-                                "calib_method": _calib.method,
-                                "calib_is_fallback": _calib.is_fallback,
-                                "timing_source": _timing_source,
-                            })
-                        except Exception as e:
-                            metrics_status = "partial"
-                            realtime_error_count += 1
-                            logger.exception("[REALTIME_REP_METRIC_ERROR] rep=%s err=%s", set_rep_count, e)
-
-                    logger.info(
-                        "[REALTIME_REP_DONE] rep=%d frame=%d phase=%s metrics=%s",
-                        set_rep_count,
-                        frame_n,
-                        state,
-                        metrics_status,
-                    )
-                    _rt_trace(frame_n, set_rep_count, "rep_changed")
-                    _rep_trace(old_rep_count, set_rep_count, frame_n)
-                    if DEBUG_RT_TRACE:
-                        print(
-                            f"[REP_CHANGE] old={old_rep_count} new={set_rep_count} frame={frame_n} phase={state}",
-                            flush=True,
+                    if concentric_time > 0.05 and y_bottom > 0:
+                        bottom_y_px = y_bottom
+                        top_y_px = smoothed_y
+                        depth_meters, depth_err, pixel_delta = safe_compute_depth(
+                            top_y_px,
+                            bottom_y_px,
+                            scale_m_per_px,
+                            last_valid_depth_m=last_valid_depth_m,
                         )
+                        skip_rep_update = depth_err is not None
+                        if depth_err is not None:
+                            invalid_depth_count += 1
+                            now_guard = time.perf_counter()
+                            if (now_guard - last_depth_guard_log_ts) >= DEPTH_GUARD_LOG_INTERVAL_S:
+                                logger.warning(
+                                    "[DEPTH_GUARD] frame=%d rep=%d err=%s last_valid=%s",
+                                    frame_n,
+                                    set_rep_count,
+                                    depth_err,
+                                    f"{last_valid_depth_m:.3f}" if last_valid_depth_m is not None else "None",
+                                )
+                                last_depth_guard_log_ts = now_guard
+                        else:
+                            invalid_depth_count = 0
+                            last_valid_depth_m = depth_meters
+                            skip_rep_update = False
+
+                        if invalid_depth_count > 30:
+                            logger.warning("[DEPTH_GUARD_RESET] too_many_invalid_depths, reset squat state only")
+                            state = "STANDING"
+                            phase_cn = "STANDING"
+                            y_lowest = -1.0
+                            y_bottom = -1.0
+                            starting_height = -1.0
+                            frames_in_buffer = 0
+                            running_avg_y = smoothed_y
+                            prev_inst_v = None
+                            rom_completion_pct = 0.0
+                            ascent_samples = []
+                            current_rep_x_coords.clear()
+                            invalid_depth_count = 0
+                            continue
+
+                        if skip_rep_update or depth_meters is None:
+                            if set_rep_count == 1:
+                                reference_max_displacement = abs(starting_height - y_lowest)
+                            last_completed_rom_pct = rom_completion_pct
+                            current_rep_x_coords.clear()
+                            state = "STANDING"
+                            y_lowest = -1.0
+                            y_bottom = -1.0
+                            starting_height = -1.0
+                            frames_in_buffer = 0
+                            running_avg_y = smoothed_y
+                            prev_inst_v = None
+                            rom_completion_pct = 0.0
+                            logger.info("Rep guard skip: invalid depth, 状态重置为 STANDING，等待下一动作")
+                            continue
+
+                        mcv = depth_meters / concentric_time
+                        rom_m = depth_meters
+                        rep_peak_vel = float(max(ascent_samples)) if ascent_samples else 0.0
+                        if rom_m >= (min_rom - 0.005) and mcv >= (MIN_MCV_M_S - 0.005):
+                            set_rep_count += 1
+                            current_rep_velocity = float(mcv)
+                            rep_velocities_in_set.append(float(mcv))
+                            best_velocity_in_set = max(rep_velocities_in_set)
+                            last_rep_peak_vel = rep_peak_vel
+                            # Path Shift 仅用 UP 阶段 collected X，仅在此处结算一次
+                            if len(current_rep_x_coords) > 0 and scale_m_per_px is not None:
+                                shift_px = max(current_rep_x_coords) - min(current_rep_x_coords)
+                                last_bar_shift_cm = shift_px * scale_m_per_px * 100.0
+                            if set_rep_count == 1:
+                                current_v_loss = 0.0
+                                stored_loss = None
+                            else:
+                                loss_rate = (best_velocity_in_set - mcv) / best_velocity_in_set if best_velocity_in_set > 0 else 0.0
+                                current_v_loss = loss_rate * 100.0
+                                stored_loss = current_v_loss
+                                if best_velocity_in_set > 0 and mcv < 0.7 * best_velocity_in_set:
+                                    logger.warning("Fatigue 70%% reached: V_mean=%.3f < 0.7*Best_mean=%.3f", mcv, 0.7 * best_velocity_in_set)
+                            rep_issue_tags = ",".join(sorted(set(accumulated_pose_issues))) if accumulated_pose_issues else None
+                            accumulated_pose_issues.clear()
+                            safe_load_kg = safe_get_current_load_kg()
+                            safe_user_name = safe_get_current_user_name()
+                            logger.info(
+                                "[REP_SAVE_ENTER] rep=%d mcv=%.3f rom=%.3f user=%s load=%.1f",
+                                set_rep_count,
+                                mcv,
+                                rom_m,
+                                safe_user_name,
+                                safe_load_kg,
+                            )
+                            try:
+                                _insert_rep_async(
+                                    DB_PATH, set_rep_count, mcv, rom_m, lk, rk, tr, None,
+                                    depth_offset_cm, safe_load_kg, stored_loss, safe_user_name,
+                                    rom_completion_pct, set_number, session_id, user_height_cm,
+                                    rep_issue_tags,
+                                    calib_method=_calib.method,
+                                    calib_is_fallback=_calib.is_fallback,
+                                    timing_source=_timing_source,
+                                )
+                                logger.info("[REP_SAVE_OK] rep=%d", set_rep_count)
+                            except Exception as e:
+                                logger.exception("[REP_SAVE_ERROR] rep=%d err=%s", set_rep_count, e)
+                            _rt_trace(frame_n, set_rep_count, "rep_changed")
+                            _rep_trace(old_rep_count, set_rep_count, frame_n)
+                            if DEBUG_RT_TRACE:
+                                print(
+                                    f"[REP_CHANGE] old={old_rep_count} new={set_rep_count} frame={frame_n} depth={depth_meters:.3f} phase={state} m_per_px={scale_m_per_px:.6f}",
+                                    flush=True,
+                                )
                     if set_rep_count == 1:
                         reference_max_displacement = abs(starting_height - y_lowest)
                     last_completed_rom_pct = rom_completion_pct
@@ -1590,30 +1342,22 @@ def process_squat_video(
 
         _rt_trace(frame_n, set_rep_count, "before_hud_draw")
         ui_t0 = time.perf_counter()
-        if realtime_lowload:
-            if frame_n % max(1, REALTIME_HUD_EVERY) == 0:
-                _render_minimal_hud(frame_bgr, phase_cn, set_rep_count, fps, current_rep_velocity)
-        else:
-            _draw_bar_path(frame_bgr, bar_path_buffer, h, w)
+        _draw_bar_path(frame_bgr, bar_path_buffer, h, w)
 
-            best_mean_vel = max(rep_velocities_in_set) if rep_velocities_in_set else 0.0
-            inst_vel_for_hud = current_rep_velocity
-            is_fatigue_70 = (
-                best_mean_vel > 0 and len(rep_velocities_in_set) > 0
-                and rep_velocities_in_set[-1] < 0.7 * best_mean_vel
-            )
-            _render_hud(frame_bgr, phase_cn, set_rep_count, inst_vel_for_hud, best_mean_vel, current_v_loss, depth_offset_cm, fps,
-                        bar_shift_cm=last_bar_shift_cm,
-                        debug_ratio=scale_m_per_px if scale_m_per_px is not None else debug_ratio,
-                        debug_dt=debug_dt, debug_raw_dy_px=debug_raw_dy_px)
-            _render_fatigue_indicator(frame_bgr, is_fatigue_70, frame_n)
+        best_mean_vel = max(rep_velocities_in_set) if rep_velocities_in_set else 0.0
+        inst_vel_for_hud = current_rep_velocity
+        is_fatigue_70 = (
+            best_mean_vel > 0 and len(rep_velocities_in_set) > 0
+            and rep_velocities_in_set[-1] < 0.7 * best_mean_vel
+        )
+        _render_hud(frame_bgr, phase_cn, set_rep_count, inst_vel_for_hud, best_mean_vel, current_v_loss, depth_offset_cm, fps,
+                    bar_shift_cm=last_bar_shift_cm,
+                    debug_ratio=scale_m_per_px if scale_m_per_px is not None else debug_ratio,
+                    debug_dt=debug_dt, debug_raw_dy_px=debug_raw_dy_px)
+        _render_fatigue_indicator(frame_bgr, is_fatigue_70, frame_n)
 
-            if pose_diag_enabled and last_pose_diag.issues:
-                _render_pose_warnings(frame_bgr, kps, last_pose_diag, h, w, frame_n)
-        if realtime_lowload:
-            best_mean_vel = max(rep_velocities_in_set) if rep_velocities_in_set else 0.0
-            inst_vel_for_hud = current_rep_velocity
-            is_fatigue_70 = False
+        if pose_diag_enabled and last_pose_diag.issues:
+            _render_pose_warnings(frame_bgr, kps, last_pose_diag, h, w, frame_n)
         ui_update_ms = (time.perf_counter() - ui_t0) * 1000.0
         _rt_trace(frame_n, set_rep_count, "after_hud_draw")
 
@@ -1630,112 +1374,62 @@ def process_squat_video(
             pass
 
         last_rep_mean = rep_velocities_in_set[-1] if rep_velocities_in_set else None
-        yield_ms = 0.0
-        if realtime_lowload:
-            payload_t0 = time.perf_counter()
-            stats = {
-                "reps": set_rep_count,
-                "phase": phase_cn,
-                "fps": fps_val,
-                "latency_ms": latency_ms_val,
-                "inst_velocity": float(inst_vel_for_hud) if inst_vel_for_hud is not None else 0.0,
-                "best_mean_velocity": float(best_mean_vel) if best_mean_vel is not None else 0.0,
-                "velocity_loss": float(current_v_loss) if current_v_loss is not None else 0.0,
-                "depth_offset_cm": float(depth_offset_cm) if depth_offset_cm is not None else None,
-                "is_realtime": True,
-                "rep_buffer_size": len(realtime_rep_buffer),
-                "recording_path": recording_path,
-                "ui_mode": "compact",
-                "frame_id": frame_n,
-                "is_demo_mode": bool(REALTIME_LOWLOAD_MODE),
-                "error": None,
-            }
-            _rt_trace(frame_n, set_rep_count, "before_yield")
-            try:
-                yield frame_bgr, stats
-            except Exception as e:
-                realtime_error_count += 1
-                logger.exception("[REALTIME_YIELD_ERROR] frame=%s rep=%s err=%s", frame_n, set_rep_count, e)
-            _rt_trace(frame_n, set_rep_count, "after_yield")
-            yield_ms = (time.perf_counter() - payload_t0) * 1000.0
-        else:
-            stats = {
-                "reps": set_rep_count,
-                "current_vel": float(last_rep_mean) if last_rep_mean is not None else current_rep_velocity,
-                "best_vel": best_mean_vel,
-                "velocity_loss_pct": current_v_loss,
-                "phase": phase_cn,
-                "fps": fps,
-                "latency_ms": latency_ms_val,
-                "is_fatigue_70": is_fatigue_70,
-                "rom_completion_pct": stats_rom,
-                "calibration_fallback": calibration_fallback,
-                "recording_path": recording_path,
-                "rep_mean_vel": last_rep_mean,
-                "rep_peak_vel": last_rep_peak_vel if rep_velocities_in_set else None,
-                "bar_shift_cm": last_bar_shift_cm,
-                "pose_diag": {
-                    "knee_valgus": last_pose_diag.knee_valgus,
-                    "knee_ratio": last_pose_diag.knee_ratio,
-                    "torso_lean_warning": last_pose_diag.torso_lean_warning,
-                    "torso_angle": last_pose_diag.torso_angle,
-                    "stability_warning": last_pose_diag.stability_warning,
-                    "hip_x_drift_ratio": last_pose_diag.hip_x_drift_ratio,
-                    "issues": last_pose_diag.issues,
-                    "score": last_pose_diag.score,
-                } if pose_diag_enabled else None,
-                "rep_velocities": list(rep_velocities_in_set),
-                # ── 标定诊断字段（只读，供实验验证模块使用，不影响主看板）──
-                "calib_scale_m_per_px": scale_m_per_px,
-                "calib_body_height_px": body_height_px,
-                "calib_method_used": _calib.method if is_calibrated else None,
-                "calib_is_fallback": calibration_fallback,
-            }
-            _rt_trace(frame_n, set_rep_count, "before_yield")
-            yield frame_bgr, stats
-            _rt_trace(frame_n, set_rep_count, "after_yield")
+        stats = {
+            "reps": set_rep_count,
+            "current_vel": float(last_rep_mean) if last_rep_mean is not None else current_rep_velocity,
+            "best_vel": best_mean_vel,
+            "velocity_loss_pct": current_v_loss,
+            "phase": phase_cn,
+            "fps": fps,
+            "latency_ms": latency_ms_val,
+            "is_fatigue_70": is_fatigue_70,
+            "rom_completion_pct": stats_rom,
+            "calibration_fallback": calibration_fallback,
+            "recording_path": recording_path,
+            "rep_mean_vel": last_rep_mean,
+            "rep_peak_vel": last_rep_peak_vel if rep_velocities_in_set else None,
+            "bar_shift_cm": last_bar_shift_cm,
+            "pose_diag": {
+                "knee_valgus": last_pose_diag.knee_valgus,
+                "knee_ratio": last_pose_diag.knee_ratio,
+                "torso_lean_warning": last_pose_diag.torso_lean_warning,
+                "torso_angle": last_pose_diag.torso_angle,
+                "stability_warning": last_pose_diag.stability_warning,
+                "hip_x_drift_ratio": last_pose_diag.hip_x_drift_ratio,
+                "issues": last_pose_diag.issues,
+                "score": last_pose_diag.score,
+            } if pose_diag_enabled else None,
+            "rep_velocities": list(rep_velocities_in_set),
+            # ── 标定诊断字段（只读，供实验验证模块使用，不影响主看板）──
+            "calib_scale_m_per_px": scale_m_per_px,
+            "calib_body_height_px": body_height_px,
+            "calib_method_used": _calib.method if is_calibrated else None,
+            "calib_is_fallback": calibration_fallback,
+        }
+        _rt_trace(frame_n, set_rep_count, "before_yield")
+        yield frame_bgr, stats
+        _rt_trace(frame_n, set_rep_count, "after_yield")
         loop_total_ms = (time.perf_counter() - loop_t0) * 1000.0
 
-        perf_ema_ms["cap"] = camera_read_ms if perf_ema_ms["cap"] is None else (0.2 * camera_read_ms + 0.8 * perf_ema_ms["cap"])
-        perf_ema_ms["infer"] = pose_infer_ms if perf_ema_ms["infer"] is None else (0.2 * pose_infer_ms + 0.8 * perf_ema_ms["infer"])
-        perf_ema_ms["rep"] = rep_count_ms if perf_ema_ms["rep"] is None else (0.2 * rep_count_ms + 0.8 * perf_ema_ms["rep"])
-        perf_ema_ms["writer"] = video_write_ms if perf_ema_ms["writer"] is None else (0.2 * video_write_ms + 0.8 * perf_ema_ms["writer"])
-        perf_ema_ms["hud"] = ui_update_ms if perf_ema_ms["hud"] is None else (0.2 * ui_update_ms + 0.8 * perf_ema_ms["hud"])
-        perf_ema_ms["yield"] = yield_ms if perf_ema_ms["yield"] is None else (0.2 * yield_ms + 0.8 * perf_ema_ms["yield"])
-        perf_ema_ms["loop"] = loop_total_ms if perf_ema_ms["loop"] is None else (0.2 * loop_total_ms + 0.8 * perf_ema_ms["loop"])
+        perf_ema_ms["camera_read"] = camera_read_ms if perf_ema_ms["camera_read"] is None else (0.2 * camera_read_ms + 0.8 * perf_ema_ms["camera_read"])
+        perf_ema_ms["pose_infer"] = pose_infer_ms if perf_ema_ms["pose_infer"] is None else (0.2 * pose_infer_ms + 0.8 * perf_ema_ms["pose_infer"])
+        perf_ema_ms["rep_count"] = rep_count_ms if perf_ema_ms["rep_count"] is None else (0.2 * rep_count_ms + 0.8 * perf_ema_ms["rep_count"])
+        perf_ema_ms["video_write"] = video_write_ms if perf_ema_ms["video_write"] is None else (0.2 * video_write_ms + 0.8 * perf_ema_ms["video_write"])
+        perf_ema_ms["ui_update"] = ui_update_ms if perf_ema_ms["ui_update"] is None else (0.2 * ui_update_ms + 0.8 * perf_ema_ms["ui_update"])
+        perf_ema_ms["loop_total"] = loop_total_ms if perf_ema_ms["loop_total"] is None else (0.2 * loop_total_ms + 0.8 * perf_ema_ms["loop_total"])
 
         now_perf = time.perf_counter()
-        if (now_perf - last_heartbeat_ts) >= 1.0:
-            writer_q = video_writer_worker.qsize() if video_writer_worker is not None else 0
-            infer_per_s = infer_count - last_heartbeat_infer_count
-            last_heartbeat_infer_count = infer_count
-            logger.info(
-                "[REALTIME_HEARTBEAT] frame=%s rep=%s fps=%.1f loop_ms=%.1f cap_ms=%.1f infer_ms=%.1f rep_ms=%.1f hud_ms=%.1f yield_ms=%.1f writer_q=%s ui_mode=%s infer_hz=%s",
-                frame_n,
-                set_rep_count,
-                fps_val,
-                perf_ema_ms["loop"] or loop_total_ms,
-                perf_ema_ms["cap"] or camera_read_ms,
-                perf_ema_ms["infer"] or pose_infer_ms,
-                perf_ema_ms["rep"] or rep_count_ms,
-                perf_ema_ms["hud"] or ui_update_ms,
-                perf_ema_ms["yield"] or yield_ms,
-                writer_q,
-                "compact" if realtime_lowload else "full",
-                infer_per_s,
-            )
-            last_heartbeat_ts = now_perf
-        if (now_perf - last_perf_log_ts) >= PERF_LOG_INTERVAL_S and not realtime_lowload:
+        if (now_perf - last_perf_log_ts) >= PERF_LOG_INTERVAL_S:
             logger.info(
                 "rt_perf frame=%d reps=%d cam=%.2fms infer=%.2fms rep=%.2fms writer=%.2fms ui=%.2fms loop=%.2fms fps=%.1f rec=%s drop=%d",
                 frame_n,
                 set_rep_count,
-                perf_ema_ms["cap"] or 0.0,
-                perf_ema_ms["infer"] or 0.0,
-                perf_ema_ms["rep"] or 0.0,
-                perf_ema_ms["writer"] or 0.0,
-                perf_ema_ms["hud"] or 0.0,
-                perf_ema_ms["loop"] or 0.0,
+                perf_ema_ms["camera_read"] or 0.0,
+                perf_ema_ms["pose_infer"] or 0.0,
+                perf_ema_ms["rep_count"] or 0.0,
+                perf_ema_ms["video_write"] or 0.0,
+                perf_ema_ms["ui_update"] or 0.0,
+                perf_ema_ms["loop_total"] or 0.0,
                 fps_val,
                 "on" if video_writer_worker is not None else "off",
                 (video_writer_worker.dropped_frames if video_writer_worker is not None else 0),
@@ -1744,24 +1438,8 @@ def process_squat_video(
 
         if not is_camera and video_fps is not None and video_fps > 0:
             time.sleep(1.0 / video_fps)
-        elif is_camera and frame_interval_s > 0:
-            elapsed_emit = time.perf_counter() - last_frame_emit_ts if last_frame_emit_ts > 0 else frame_interval_s
-            if elapsed_emit < frame_interval_s:
-                time.sleep(frame_interval_s - elapsed_emit)
-            last_frame_emit_ts = time.perf_counter()
 
     finally:
-        if realtime_lowload:
-            try:
-                saved_path = flush_realtime_rep_buffer(
-                    realtime_rep_buffer,
-                    db_path=DB_PATH,
-                    allow_db_insert=not REALTIME_DISABLE_REP_DB_DURING_LOOP,
-                )
-                if saved_path:
-                    logger.info("[REALTIME_REP_FLUSH_JSON] path=%s", saved_path)
-            except Exception as e:
-                logger.exception("[REALTIME_REP_FLUSH_ERROR] rep=%s err=%s", "all", e)
         _cv_engine_metrics["latency_ms"] = None
         _cv_engine_metrics["fps"] = None
         if video_writer_worker is not None:
