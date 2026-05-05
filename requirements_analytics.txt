@@ -12,8 +12,10 @@ pandas>=1.3.0
 # 其他平台（macOS/Linux x86）:
 #   pip install tensorflow>=2.5.0
 
-# 摄像头支持（仅树莓派 CSI 摄像头模式需要）:
-# picamera2
+# 树莓派推理与 CSI 摄像头支持
+# tflite-runtime 体积小、启动快；picamera2 用于 Raspberry Pi CSI 摄像头模式。
+tflite-runtime
+picamera2
 
 # 可选性能监控:
-# psutil
+psutil

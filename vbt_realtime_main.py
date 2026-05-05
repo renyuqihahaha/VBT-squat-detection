@@ -1,4 +1,4 @@
-giut#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """VBT 实时引擎：MoveNet 骨骼绘制、VBT 疲劳判定、断点续存、非阻塞语音。"""
 
@@ -30,6 +30,7 @@ from vbt_analytics_pro import (
 )
 from vbt_runtime_config import get_current_load_kg, get_current_user_name, get_user_height_cm
 from physics_converter import get_depth_offset
+from vbt_cv_engine import AsyncCameraReader
 
 try:
     from tflite_runtime.interpreter import Interpreter
@@ -248,16 +249,25 @@ def main():
     # [1] 数据库层：断点续存，仅当 DB 不存在时建表
     ensure_db_safe(DB_PATH)
 
-    # [2] 摄像头初始化
+    # [2] 摄像头初始化：启动异步生产者线程，后续主循环只做 Consumer。
     active_camera_index = int(args.camera_index)
     logger.info(f"[1/3] Camera bootstrap... 正在尝试开启相机 (Index: {active_camera_index})...")
-    cap = _open_and_probe_camera(active_camera_index, max_attempts=8, required_consecutive_ok=3)
-    if cap is None:
+    reader = AsyncCameraReader(active_camera_index)
+    if not reader.start():
         # H65 失败时仅尝试 10 以外偶数节点，跳过奇数元数据节点
         even_candidates = tuple(i for i in (0, 2, 4, 6) if i != active_camera_index)
         logger.info(f"相机开启失败 (Index: {active_camera_index})，启动偶数节点探测 {list(even_candidates)}...")
-        cap, active_camera_index = _brutal_scan_cameras(candidates=even_candidates)
-        if cap is None:
+        reader.stop()
+        reader = None
+        for candidate in even_candidates:
+            candidate_reader = AsyncCameraReader(candidate)
+            if candidate_reader.start():
+                reader = candidate_reader
+                active_camera_index = candidate
+                print(f"成功！自动切换至索引 {candidate}", flush=True)
+                break
+            candidate_reader.stop()
+        if reader is None:
             if sys.platform == "darwin":
                 logger.error("❌ 未检测到摄像头。请检查：1. 系统偏好设置 → 隐私与安全性 → 摄像头 2. 尝试 --camera-index 0")
             else:
@@ -276,9 +286,9 @@ def main():
         cv2.resizeWindow(window_name, 960, 720)
         cv2.moveWindow(window_name, 40, 40)
         cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-        # 首帧立即显示，确保 2 秒内能看到画面
-        ok, first_frame = cap.read()
-        if ok and first_frame is not None and first_frame.size > 0:
+        # 首帧立即显示，确保 2 秒内能看到画面；从异步队列取最新帧。
+        first_frame = reader.read(timeout=2.0)
+        if first_frame is not None and first_frame.size > 0:
             cv2.imshow(window_name, first_frame)
             cv2.waitKey(1)
 
@@ -292,7 +302,7 @@ def main():
         logger.info("[2/3] AI Model ready")
     except Exception as e:
         logger.error(f"模型加载失败: {e}")
-        cap.release()
+        reader.stop()
         return
 
     state = "STANDING"
@@ -341,18 +351,11 @@ def main():
     try:
         while True:
             loop_t0 = time.perf_counter()
-            ok, frame_bgr = cap.read()
-            if not ok:
-                # 每次失败做轻量重试，最多 3 次
-                retry_ok = False
-                for _ in range(3):
-                    ok, frame_bgr = cap.read()
-                    if ok:
-                        retry_ok = True
-                        break
-                    time.sleep(0.01)
-                if not retry_ok:
-                    continue
+            # Consumer：从 AsyncCameraReader 获取最新帧。
+            # 生产者队列满时会丢弃最老帧，因此这里不会处理积压的历史画面。
+            frame_bgr = reader.read(timeout=0.5)
+            if frame_bgr is None:
+                continue
             if frame_bgr is None or frame_bgr.size == 0:
                 continue
             t_now = time.time()
@@ -590,10 +593,18 @@ def main():
         logger.info("收到 KeyboardInterrupt，准备优雅退出...")
     finally:
         try:
-            cap.release()
+            reader.stop()
+            logger.info(
+                "异步摄像头读取器已停止: read=%d dropped=%d",
+                reader.read_frames,
+                reader.dropped_frames,
+            )
         except Exception:
             pass
-        pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

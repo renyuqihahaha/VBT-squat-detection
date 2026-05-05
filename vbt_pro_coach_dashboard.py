@@ -79,39 +79,16 @@ AUTO_RECOVER_FPS = 12.0
 AUTO_DEGRADE_COUNT = 8
 AUTO_RECOVER_COUNT = 15
 EMA_ALPHA = 0.2
-VIDEO_REFRESH_INTERVAL = 0.08
+VIDEO_REFRESH_INTERVAL = 0.10
 METRIC_REFRESH_INTERVAL = 1.00
-CHART_REFRESH_INTERVAL = 2.00
-HISTORY_REFRESH_INTERVAL = 1.00
+CHART_REFRESH_INTERVAL = 1.00
 POSE_REFRESH_INTERVAL = 1.00
 FATIGUE_REFRESH_INTERVAL = 1.00
-DEMO_PRESENTATION_MODE = True
-DEMO_TARGET_DISPLAY_FPS = 20
-DEMO_VIDEO_ONLY_PRIORITY = True
-DEMO_MINIMAL_HUD = True
-DEMO_CHART_REFRESH_SEC = 1.5
-DEMO_METRIC_REFRESH_SEC = 0.8
-DEMO_DISABLE_HISTORY_TABLE = True
-DEMO_VIDEO_REFRESH_INTERVAL = 1.0 / DEMO_TARGET_DISPLAY_FPS
 VIDEO_SIZE_PRESETS = {
     "Small": 640,
     "Medium": 960,
     "Large": 1280,
 }
-
-
-# Chart key naming convention: chart_<mode>_<section>_<purpose>.
-# Keep keys stable and globally unique across all Streamlit render paths.
-def make_chart_key(prefix: str, scope: str = "main") -> str:
-    return f"{prefix}_{scope}"
-
-
-def next_plotly_key(prefix: str = "plotly") -> str:
-    import streamlit as st
-    if "_global_plotly_key_seq" not in st.session_state:
-        st.session_state["_global_plotly_key_seq"] = 0
-    st.session_state["_global_plotly_key_seq"] += 1
-    return f"{prefix}_{st.session_state['_global_plotly_key_seq']}"
 
 
 def _get_display_config_from_sidebar() -> str:
@@ -211,20 +188,6 @@ def _build_metric_snapshot(stats: dict, rep_velocities: list[float]) -> tuple:
     rom_val = _safe_float(rom_pct, 0.0) if rom_pct is not None else None
     phase = str(stats.get("phase", ""))
     return (reps, round(cur_mean, 3), round(best_mean, 3), round(v_loss, 1), fps, None if rom_val is None else round(rom_val, 1), phase)
-
-
-def _render_demo_metrics(container, stats: dict, rep_velocities: list[float], latency_ms: float = 0.0) -> None:
-    with container.container():
-        reps = int(stats.get("reps", 0) or 0)
-        phase = str(stats.get("phase", "—"))
-        fps = _safe_float(stats.get("fps"), 0.0)
-        best_v = max(rep_velocities) if rep_velocities else _safe_float(stats.get("best_mean_velocity", stats.get("best_vel", 0.0)), 0.0)
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Reps", reps)
-        c2.metric("Phase", phase)
-        c3.metric("FPS", f"{fps:.1f}")
-        c4.metric("Latency", f"{latency_ms:.0f} ms")
-        st.caption(f"Best Velocity: {best_v:.3f} m/s")
 
 
 def _render_metrics_block(container, stats: dict, rep_velocities: list[float]) -> None:
@@ -460,14 +423,9 @@ def _render_mode_badge(placeholder, state: dict) -> None:
 
 
 def _update_perf_placeholders(stats: dict, placeholders: dict, perf_state: dict) -> None:
-    """循环内同步更新侧边栏性能占位符（EMA 平滑 + 低频刷新）。"""
+    """循环内同步更新侧边栏性能占位符（EMA 平滑 + 每 10 帧降频刷新）。"""
     if not placeholders:
         return
-    now = time.time()
-    last_ts = float(perf_state.get("last_render_ts", 0.0) or 0.0)
-    if now - last_ts < 1.0:
-        return
-    perf_state["last_render_ts"] = now
     perf_state["frame_count"] += 1
     alpha = perf_state["alpha"]
 
@@ -479,16 +437,17 @@ def _update_perf_placeholders(stats: dict, placeholders: dict, perf_state: dict)
     perf_state["ema_fps"] = current_fps if perf_state["ema_fps"] is None else (alpha * current_fps) + ((1 - alpha) * perf_state["ema_fps"])
     perf_state["ema_lat"] = current_lat if perf_state["ema_lat"] is None else (alpha * current_lat) + ((1 - alpha) * perf_state["ema_lat"])
 
-    try:
-        cpu_str = f"{perf_state['ema_cpu']:.1f} %" if perf_state["ema_cpu"] >= 0 else "N/A"
-        mem_pct = float(psutil.virtual_memory().percent) if HAS_PSUTIL else -1.0
-        mem_str = f"{mem_pct:.1f} %" if mem_pct >= 0 else "N/A"
-        placeholders["cpu"].metric("💻 CPU", cpu_str)
-        placeholders["ram"].metric("🧠 RAM", mem_str)
-        placeholders["fps"].metric("🎞️ FPS", f"{perf_state['ema_fps']:.1f}")
-        placeholders["latency"].metric("⏱️ Latency", f"{perf_state['ema_lat']:.0f} ms")
-    except Exception:
-        pass
+    if perf_state["frame_count"] % 10 == 0:
+        try:
+            cpu_str = f"{perf_state['ema_cpu']:.1f} %" if perf_state["ema_cpu"] >= 0 else "N/A"
+            mem_pct = float(psutil.virtual_memory().percent) if HAS_PSUTIL else -1.0
+            mem_str = f"{mem_pct:.1f} %" if mem_pct >= 0 else "N/A"
+            placeholders["cpu"].metric("💻 CPU", cpu_str)
+            placeholders["ram"].metric("🧠 RAM", mem_str)
+            placeholders["fps"].metric("🎞️ FPS", f"{perf_state['ema_fps']:.1f}")
+            placeholders["latency"].metric("⏱️ Latency", f"{perf_state['ema_lat']:.0f} ms")
+        except Exception:
+            pass
 
 
 def _get_hw_metrics_cached() -> tuple[float, float]:
@@ -726,10 +685,6 @@ def _render_dual_mode_sidebar() -> tuple[str, int, float]:
     )
     st.session_state["use_plate_calibration"] = st.session_state.get("sidebar_plate_calib", False)
 
-    st.sidebar.checkbox("演示模式 / Demo Mode", value=bool(st.session_state.get("demo_presentation_mode", DEMO_PRESENTATION_MODE)), key="sidebar_demo_mode")
-    st.session_state["demo_presentation_mode"] = bool(st.session_state.get("sidebar_demo_mode", DEMO_PRESENTATION_MODE))
-    st.sidebar.caption("演示模式：优先视频顺滑，图表/历史低频或隐藏。")
-
     st.sidebar.markdown("---")
 
     # ── 边缘计算引擎状态（唯一实例，st.empty 占位符，循环内同步更新）──
@@ -764,17 +719,21 @@ def _render_mode_a_realtime() -> None:
     import traceback
 
     st.subheader("实时采集 (树莓派)")
-    demo_mode = bool(st.session_state.get("demo_presentation_mode", DEMO_PRESENTATION_MODE))
 
     for key, default in [("rt_running", False), ("rt_stop_flag", None), ("rt_camera_idx", 0)]:
         if key not in st.session_state:
             st.session_state[key] = default
     st.session_state["realtime_running"] = bool(st.session_state.get("rt_running", False))
 
+    if "mode_a_realtime_chart_seq" not in st.session_state:
+        st.session_state.mode_a_realtime_chart_seq = 0
+
+    if "mode_a_realtime_last_chart_ts" not in st.session_state:
+        st.session_state.mode_a_realtime_last_chart_ts = 0.0
+
     is_running = st.session_state["rt_running"]
 
     col_cfg, col_ctrl = st.columns([1, 1])
-    start_requested = False
     with col_cfg:
         camera_index = st.number_input(
             "摄像头索引", min_value=0, value=int(st.session_state["rt_camera_idx"]),
@@ -795,8 +754,7 @@ def _render_mode_a_realtime() -> None:
                 st.session_state["rt_target_reached_notice_shown"] = False
                 st.session_state["last_finalize_error"] = ""
                 st.session_state["rt_stop_flag"] = threading.Event()
-                start_requested = True
-                is_running = True
+                st.rerun()
         else:
             if st.button("⏹ 停止采集", type="secondary", width="stretch", key="rt_stop"):
                 flag = st.session_state.get("rt_stop_flag")
@@ -807,7 +765,7 @@ def _render_mode_a_realtime() -> None:
                 st.session_state["recording_active"] = False
                 st.session_state["rt_user_stop_requested"] = True
 
-    if not is_running and not start_requested:
+    if not is_running:
         st.info("点击「开始采集」启动摄像头，系统将自动进行实时深蹲分析。")
         return
 
@@ -827,9 +785,12 @@ def _render_mode_a_realtime() -> None:
     stop_flag = st.session_state["rt_stop_flag"]
     cam_idx = int(st.session_state["rt_camera_idx"])
 
-    video_display_width = int(st.session_state.get("video_display_width", VIDEO_SIZE_PRESETS["Medium"]))
+    st.caption(f"📋 课号: {rt_session} | 第 {rt_set} 组 | 身高: {rt_height:.0f}cm | 摄像头: {cam_idx}")
+
     status_slot = st.empty()
-    warning_slot = st.empty()
+    status_slot.info(f"正在初始化摄像头 (索引 {cam_idx})，请稍候...")
+
+    video_display_width = int(st.session_state.get("video_display_width", VIDEO_SIZE_PRESETS["Medium"]))
     video_col, panel_col = st.columns([1.15, 1.0])
     with video_col:
         st.markdown("**实时画面**")
@@ -838,16 +799,12 @@ def _render_mode_a_realtime() -> None:
         calib_slot = st.empty()
     with panel_col:
         st.markdown("**实时指标**")
-        metric_slot = st.empty()
+        metrics_slot = st.empty()
         pose_slot = st.empty()
         fatigue_slot = st.empty()
         chart_slot = st.empty()
-        history_slot = st.empty()
-    heartbeat_slot = st.empty()
+    debug_slot = st.empty()
     summary_slot = st.empty()
-
-    status_slot.info(f"正在初始化摄像头 (索引 {cam_idx})，请稍候...")
-    warning_slot.caption(f"📋 课号: {rt_session} | 第 {rt_set} 组 | 身高: {rt_height:.0f}cm | 摄像头: {cam_idx}")
 
     rep_velocities: list[float] = []
     rep_rom_completions: list[float] = []
@@ -900,26 +857,22 @@ def _render_mode_a_realtime() -> None:
         time.sleep(0.3)
         status_slot.empty()
 
-        perf_state = {"ema_cpu": None, "ema_fps": None, "ema_lat": None, "frame_count": 0, "alpha": 0.2, "last_render_ts": 0.0}
+        perf_state = {"ema_cpu": None, "ema_fps": None, "ema_lat": None, "frame_count": 0, "alpha": 0.2}
         placeholders = st.session_state.get("_perf_placeholders", {})
         last_video_render_ts = 0.0
         last_metric_render_ts = 0.0
         last_chart_render_ts = 0.0
-        last_history_render_ts = 0.0
-        last_heartbeat_render_ts = 0.0
         last_pose_render_ts = 0.0
         last_fatigue_render_ts = 0.0
         last_metric_snapshot = None
         last_pose_snapshot = None
         last_fatigue_snapshot = None
-        last_history_rep_count = -1
+        last_chart_rep_count = -1
         debug_window_start_ts = time.time()
         video_update_count = 0
         metric_update_count = 0
         chart_update_count = 0
-        history_update_count = 0
         last_debug_snapshot = None
-        last_ui_degrade_log_ts = 0.0
 
         for frame_bgr, stats in gen:
             loop_start_ts = time.time()
@@ -928,25 +881,22 @@ def _render_mode_a_realtime() -> None:
                 finalize_reason = finalize_reason or "user_stop"
                 break
             _update_perf_placeholders(stats, placeholders, perf_state)
-            now_ts = time.time()
 
             selected_display_mode = st.session_state.get("selected_display_mode", "自动")
             switched = _update_display_controller(display_state, stats, selected_display_mode)
-            if _should_refresh(last_heartbeat_render_ts, 1.0, now_ts):
-                _render_mode_badge(mode_badge_placeholder, display_state)
-                if switched and selected_display_mode == "自动":
-                    notice = display_state.get("last_switch_notice", "")
-                    if notice:
-                        switch_notice_placeholder.caption(notice)
-                last_heartbeat_render_ts = now_ts
+            _render_mode_badge(mode_badge_placeholder, display_state)
+            if switched and selected_display_mode == "自动":
+                notice = display_state.get("last_switch_notice", "")
+                if notice:
+                    switch_notice_placeholder.caption(notice)
 
             if st.session_state.get("rt_mirror", False):
                 frame_bgr = cv2.flip(frame_bgr, 1)
 
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             last_frame_rgb = frame_rgb
-            video_interval = DEMO_VIDEO_REFRESH_INTERVAL if demo_mode else VIDEO_REFRESH_INTERVAL
-            if _should_render_frame(display_state) and _should_refresh(last_video_render_ts, video_interval, now_ts):
+            now_ts = time.time()
+            if _should_render_frame(display_state) and _should_refresh(last_video_render_ts, VIDEO_REFRESH_INTERVAL, now_ts):
                 display_frame = _resize_frame_for_display(frame_rgb, video_display_width)
                 video_slot.image(display_frame, channels="RGB")
                 last_video_render_ts = now_ts
@@ -960,14 +910,6 @@ def _render_mode_a_realtime() -> None:
             if not calib_warned and stats.get("calibration_fallback"):
                 calib_slot.warning("⚠️ 未检测到踝关节，已回退至躯干校准。建议拍摄全身以获得更准的速度数据。")
                 calib_warned = True
-
-            realtime_fps = float(stats.get("fps") or 0.0)
-            hide_chart = False if demo_mode else realtime_fps < 6.0
-            hide_history = DEMO_DISABLE_HISTORY_TABLE if demo_mode else realtime_fps < 6.0
-            compact_metrics = True if demo_mode else realtime_fps < 6.0
-            if compact_metrics and (now_ts - last_ui_degrade_log_ts) >= 3.0:
-                logger.info("[REALTIME_UI_DEGRADE] fps=%.1f", realtime_fps)
-                last_ui_degrade_log_ts = now_ts
 
             rc = stats.get("reps", 0)
             target_reps = int(st.session_state.get("target_reps", 0) or 0)
@@ -1001,8 +943,6 @@ def _render_mode_a_realtime() -> None:
                     rep_rom_completions = rep_rom_completions[-30:]
                 last_rep_count = rc
                 rep_changed = True
-                if demo_mode:
-                    logger.info("[DEMO_REP] rep=%s frame=%s phase=%s", rc, stats.get("frame_id", "na"), stats.get("phase", ""))
                 logger.info(
                     "[DASH_REP_CHANGE] old=%s new=%s target_reps=%s auto_stop=%s will_finalize=%s",
                     old_rc,
@@ -1014,78 +954,35 @@ def _render_mode_a_realtime() -> None:
                 if auto_stop_on_target and target_reps > 0 and rc >= target_reps:
                     logger.info("Target reached in realtime mode; waiting for manual stop: reps=%s target=%s", rc, target_reps)
 
-            if last_rep_count != last_history_rep_count and not hide_history:
-                with history_slot.container():
-                    if rep_velocities:
-                        history_df = pd.DataFrame(
-                            {
-                                "Rep": list(range(1, len(rep_velocities) + 1)),
-                                "速度 (m/s)": [round(v, 3) for v in rep_velocities],
-                            }
-                        )
-                        st.dataframe(history_df.tail(10), width="stretch", hide_index=True)
-                last_history_rep_count = last_rep_count
-                last_history_render_ts = now_ts
-                history_update_count += 1
-
             metric_snapshot = _build_metric_snapshot(stats, rep_velocities)
-            metric_interval = DEMO_METRIC_REFRESH_SEC if demo_mode else METRIC_REFRESH_INTERVAL
-            if _should_refresh(last_metric_render_ts, metric_interval, now_ts):
-                if demo_mode:
-                    demo_snapshot = (
-                        int(stats.get("reps", 0) or 0),
-                        str(stats.get("phase", "")),
-                        round(realtime_fps, 1),
-                        round(_safe_float(stats.get("latency_ms"), 0.0), 0),
-                        round(max(rep_velocities), 3) if rep_velocities else 0.0,
-                    )
-                    if demo_snapshot != last_metric_snapshot:
-                        _render_demo_metrics(metric_slot, stats, rep_velocities, _safe_float(stats.get("latency_ms"), 0.0))
-                        logger.info("[DEMO_METRIC_REFRESH] rep=%s ts=%.3f", int(stats.get("reps", 0) or 0), now_ts)
-                        last_metric_snapshot = demo_snapshot
-                        metric_update_count += 1
-                elif compact_metrics:
-                    compact_snapshot = (int(stats.get("reps", 0) or 0), str(stats.get("phase", "")), round(realtime_fps, 1))
-                    if compact_snapshot != last_metric_snapshot:
-                        with metric_slot.container():
-                            cm1, cm2, cm3 = st.columns(3)
-                            cm1.metric("Reps", compact_snapshot[0])
-                            cm2.metric("Phase", compact_snapshot[1])
-                            cm3.metric("FPS", f"{compact_snapshot[2]:.1f}")
-                        last_metric_snapshot = compact_snapshot
-                        metric_update_count += 1
-                elif metric_snapshot != last_metric_snapshot:
-                    _render_metrics_block(metric_slot, stats, rep_velocities)
-                    last_metric_snapshot = metric_snapshot
-                    metric_update_count += 1
+            if _should_refresh(last_metric_render_ts, METRIC_REFRESH_INTERVAL, now_ts) or metric_snapshot != last_metric_snapshot:
+                _render_metrics_block(metrics_slot, stats, rep_velocities)
+                last_metric_snapshot = metric_snapshot
                 last_metric_render_ts = now_ts
+                metric_update_count += 1
 
             pd_info = stats.get("pose_diag")
-            if not demo_mode and not compact_metrics and pd_info and pose_diag_on and _should_refresh(last_pose_render_ts, POSE_REFRESH_INTERVAL, now_ts):
+            if pd_info and pose_diag_on:
                 pose_snapshot = _build_pose_snapshot(pd_info)
-                if pose_snapshot != last_pose_snapshot:
+                if _should_refresh(last_pose_render_ts, POSE_REFRESH_INTERVAL, now_ts) or pose_snapshot != last_pose_snapshot:
                     _render_pose_diag_block(pose_slot, pd_info)
                     last_pose_snapshot = pose_snapshot
-                last_pose_render_ts = now_ts
+                    last_pose_render_ts = now_ts
 
             fat_pred = None
             best_v = max(rep_velocities) if rep_velocities else stats.get("best_vel", 0)
+            if len(rep_velocities) >= 3 and best_v > 0:
+                fat_pred = predict_fatigue(rep_velocities, best_v)
             training_goal = st.session_state.get("training_goal_select", "Strength")
-            fat_assess = None
-            if not demo_mode and not compact_metrics and _should_refresh(last_fatigue_render_ts, FATIGUE_REFRESH_INTERVAL, now_ts):
-                if len(rep_velocities) >= 3 and best_v > 0:
-                    fat_pred = predict_fatigue(rep_velocities, best_v)
-                fat_assess = assess_set_fatigue(rep_velocities, training_goal) if rep_velocities else None
-                if fat_assess or fat_pred:
-                    fatigue_snapshot = _build_fatigue_snapshot(fat_assess, fat_pred)
-                    if fatigue_snapshot != last_fatigue_snapshot:
-                        _render_fatigue_block(fatigue_slot, fat_assess, fat_pred)
-                        last_fatigue_snapshot = fatigue_snapshot
-                last_fatigue_render_ts = now_ts
+            fat_assess = assess_set_fatigue(rep_velocities, training_goal) if rep_velocities else None
+            if fat_assess or fat_pred:
+                fatigue_snapshot = _build_fatigue_snapshot(fat_assess, fat_pred)
+                if _should_refresh(last_fatigue_render_ts, FATIGUE_REFRESH_INTERVAL, now_ts) or fatigue_snapshot != last_fatigue_snapshot:
+                    _render_fatigue_block(fatigue_slot, fat_assess, fat_pred)
+                    last_fatigue_snapshot = fatigue_snapshot
+                    last_fatigue_render_ts = now_ts
 
-            chart_interval = DEMO_CHART_REFRESH_SEC if demo_mode else CHART_REFRESH_INTERVAL
-            should_refresh_chart = _should_refresh(last_chart_render_ts, chart_interval, now_ts) or (demo_mode and rep_changed)
-            if not hide_chart and len(rep_velocities) >= 2 and HAS_PLOTLY and should_refresh_chart:
+            if len(rep_velocities) >= 2 and HAS_PLOTLY and _should_refresh(last_chart_render_ts, CHART_REFRESH_INTERVAL, now_ts):
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=list(range(1, len(rep_velocities) + 1)),
@@ -1108,16 +1005,19 @@ def _render_mode_a_realtime() -> None:
                 fig.update_layout(
                     title="速度衰减曲线", xaxis_title="Rep", yaxis_title="m/s",
                     template="plotly_dark", height=280, margin=dict(t=40, b=30),
-                    uirevision=make_chart_key("chart_mode_a_realtime", "velocity"),
+                    uirevision="rt_chart_static",
                 )
-                chart_slot.plotly_chart(
-                    fig,
-                    width="stretch",
-                    key=make_chart_key("chart_mode_a_realtime", "velocity"),
-                )
-                if demo_mode:
-                    logger.info("[DEMO_CHART_REFRESH] rep=%s ts=%.3f", int(stats.get("reps", 0) or 0), now_ts)
+                now_ts = time.time()
+                if now_ts - st.session_state.mode_a_realtime_last_chart_ts >= 1.0:
+                    st.session_state.mode_a_realtime_chart_seq += 1
+                    st.session_state.mode_a_realtime_last_chart_ts = now_ts
+                    chart_slot.plotly_chart(
+                        fig,
+                        width="stretch",
+                        key=f"mode_a_realtime_chart_{st.session_state.mode_a_realtime_chart_seq}",
+                    )
                 last_chart_render_ts = now_ts
+                last_chart_rep_count = len(rep_velocities)
                 chart_update_count += 1
 
             debug_elapsed = now_ts - debug_window_start_ts
@@ -1129,38 +1029,23 @@ def _render_mode_a_realtime() -> None:
                     "history_len": len(rep_velocities),
                     "rep_changed": rep_changed,
                     "loop_ms": (time.time() - loop_start_ts) * 1000.0,
-                    "history_updates": history_update_count,
                 }
                 if debug_info != last_debug_snapshot:
-                    if not demo_mode:
-                        _render_debug_block(heartbeat_slot, debug_info)
+                    _render_debug_block(debug_slot, debug_info)
                     last_debug_snapshot = debug_info
-                if demo_mode:
-                    logger.info(
-                        "[DEMO_HEARTBEAT] frame=%s rep=%s fps=%.1f loop_ms=%.1f video_refresh=%s metrics_refresh=%s chart_refresh=%s",
-                        stats.get("frame_id", "na"),
-                        int(stats.get("reps", 0) or 0),
-                        realtime_fps,
-                        debug_info["loop_ms"],
-                        video_update_count,
-                        metric_update_count,
-                        chart_update_count,
-                    )
-                else:
-                    logger.info(
-                        "realtime-debug video=%s metric=%s chart=%s history=%s rep_changed=%s loop_ms=%.1f",
-                        video_update_count,
-                        metric_update_count,
-                        chart_update_count,
-                        len(rep_velocities),
-                        rep_changed,
-                        debug_info["loop_ms"],
-                    )
+                logger.info(
+                    "realtime-debug video=%s metric=%s chart=%s history=%s rep_changed=%s loop_ms=%.1f",
+                    video_update_count,
+                    metric_update_count,
+                    chart_update_count,
+                    len(rep_velocities),
+                    rep_changed,
+                    debug_info["loop_ms"],
+                )
                 debug_window_start_ts = now_ts
                 video_update_count = 0
                 metric_update_count = 0
                 chart_update_count = 0
-                history_update_count = 0
 
             time.sleep(0.01)
 
@@ -1246,7 +1131,8 @@ def _render_mode_a_realtime() -> None:
             st.info(f"第 {rt_set} 组采集完成！准备好第 {next_set} 组了吗？")
             if st.button(f"▶ 开始第 {next_set} 组", type="primary", key="rt_next_set"):
                 st.session_state["current_set_number"] = next_set
-                st.info("组号已更新，请在准备好后点击开始采集。")
+                if not st.session_state.get("realtime_running", False):
+                    st.rerun()
 
 
 def _list_local_videos() -> list[tuple[str, str]]:
@@ -1269,8 +1155,6 @@ def _render_mode_b_upload() -> None:
     import traceback
 
     st.subheader("本地视频分析")
-    logger.info("[MODE_B_UPLOAD] enter render")
-    demo_mode = bool(st.session_state.get("demo_presentation_mode", DEMO_PRESENTATION_MODE))
     st.caption("选择或上传视频，点击「开始分析」后实时展示骨架追踪与速度曲线（纯内存分析，不保存文件）")
 
     source_tab = st.radio("视频来源", ["从项目目录选择", "上传文件"], horizontal=True, key="video_source")
@@ -1336,9 +1220,6 @@ def _render_mode_b_upload() -> None:
     rep_rom_completions: list[float] = []
     last_rep_count = 0
     final_stats: Optional[dict] = None
-    velocity_fig = None
-    velocity_line_chart_df = None
-    should_render_velocity_chart = False
     last_frame_rgb = None
 
     cur_set = int(st.session_state.get("current_set_number", 1))
@@ -1378,7 +1259,7 @@ def _render_mode_b_upload() -> None:
             st.error("无法打开视频源，请检查文件路径。")
             return
 
-        perf_state = {"ema_cpu": None, "ema_fps": None, "ema_lat": None, "frame_count": 0, "alpha": 0.2, "last_render_ts": 0.0}
+        perf_state = {"ema_cpu": None, "ema_fps": None, "ema_lat": None, "frame_count": 0, "alpha": 0.2}
         placeholders = st.session_state.get("_perf_placeholders", {})
         last_video_render_ts = 0.0
         last_metric_render_ts = 0.0
@@ -1394,10 +1275,6 @@ def _render_mode_b_upload() -> None:
         metric_update_count = 0
         chart_update_count = 0
         last_debug_snapshot = None
-        video_interval = DEMO_VIDEO_REFRESH_INTERVAL if demo_mode else VIDEO_REFRESH_INTERVAL
-        metric_interval = DEMO_METRIC_REFRESH_SEC if demo_mode else METRIC_REFRESH_INTERVAL
-        chart_interval = DEMO_CHART_REFRESH_SEC if demo_mode else CHART_REFRESH_INTERVAL
-        last_demo_heartbeat_ts = 0.0
 
         for frame_bgr, stats in gen:
             loop_start_ts = time.time()
@@ -1414,7 +1291,7 @@ def _render_mode_b_upload() -> None:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             last_frame_rgb = frame_rgb
             now_ts = time.time()
-            if _should_render_frame(display_state) and _should_refresh(last_video_render_ts, video_interval, now_ts):
+            if _should_render_frame(display_state) and _should_refresh(last_video_render_ts, VIDEO_REFRESH_INTERVAL, now_ts):
                 display_frame = _resize_frame_for_display(frame_rgb, video_display_width)
                 video_container.image(display_frame, channels="RGB")
                 last_video_render_ts = now_ts
@@ -1440,47 +1317,32 @@ def _render_mode_b_upload() -> None:
                     rep_rom_completions = rep_rom_completions[-30:]
                 last_rep_count = rc
                 rep_changed = True
-                if demo_mode:
-                    logger.info("[DEMO_REP] rep=%s frame=%s phase=%s", rc, stats.get("frame_id", "na"), stats.get("phase", ""))
             final_stats = stats
 
             metric_snapshot = _build_metric_snapshot(stats, rep_velocities)
-            if _should_refresh(last_metric_render_ts, metric_interval, now_ts) or (not demo_mode and metric_snapshot != last_metric_snapshot):
-                if demo_mode:
-                    demo_snapshot = (
-                        int(stats.get("reps", 0) or 0),
-                        str(stats.get("phase", "")),
-                        round(_safe_float(stats.get("fps"), 0.0), 1),
-                        round(_safe_float(stats.get("latency_ms"), 0.0), 0),
-                    )
-                    if demo_snapshot != last_metric_snapshot:
-                        _render_demo_metrics(metrics_container, stats, rep_velocities, _safe_float(stats.get("latency_ms"), 0.0))
-                        logger.info("[DEMO_METRIC_REFRESH] rep=%s ts=%.3f", int(stats.get("reps", 0) or 0), now_ts)
-                        last_metric_snapshot = demo_snapshot
-                        metric_update_count += 1
-                else:
-                    _render_metrics_block(metrics_container, stats, rep_velocities)
-                    with metrics_container.container():
-                        st.caption(f"📊 Total Reps: {stats.get('reps', 0)}")
-                        avg_rom = sum(rep_rom_completions) / len(rep_rom_completions) if rep_rom_completions else 0.0
-                        avg_str = f"{avg_rom:.1f}%"
-                        if rep_rom_completions:
-                            if avg_rom < 90:
-                                st.markdown(
-                                    f'<span class="rom-low">平均完成度: {avg_str} ⚠ 幅度不足</span>',
-                                    unsafe_allow_html=True,
-                                )
-                            else:
-                                st.markdown(
-                                    f'<span class="rom-ok">平均完成度: {avg_str}</span>',
-                                    unsafe_allow_html=True,
-                                )
-                    last_metric_snapshot = metric_snapshot + (round(avg_rom, 1),)
-                    metric_update_count += 1
+            if _should_refresh(last_metric_render_ts, METRIC_REFRESH_INTERVAL, now_ts) or metric_snapshot != last_metric_snapshot:
+                _render_metrics_block(metrics_container, stats, rep_velocities)
+                with metrics_container.container():
+                    st.caption(f"📊 Total Reps: {stats.get('reps', 0)}")
+                    avg_rom = sum(rep_rom_completions) / len(rep_rom_completions) if rep_rom_completions else 0.0
+                    avg_str = f"{avg_rom:.1f}%"
+                    if rep_rom_completions:
+                        if avg_rom < 90:
+                            st.markdown(
+                                f'<span class="rom-low">平均完成度: {avg_str} ⚠ 幅度不足</span>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<span class="rom-ok">平均完成度: {avg_str}</span>',
+                                unsafe_allow_html=True,
+                            )
+                last_metric_snapshot = metric_snapshot + (round(avg_rom, 1),)
                 last_metric_render_ts = now_ts
+                metric_update_count += 1
 
             up_pd = stats.get("pose_diag")
-            if not demo_mode and up_pd and pose_diag_on_b:
+            if up_pd and pose_diag_on_b:
                 pose_snapshot = _build_pose_snapshot(up_pd)
                 if _should_refresh(last_pose_render_ts, POSE_REFRESH_INTERVAL, now_ts) or pose_snapshot != last_pose_snapshot:
                     _render_pose_diag_block(upload_pose_slot, up_pd)
@@ -1493,15 +1355,14 @@ def _render_mode_b_upload() -> None:
                 up_fat = predict_fatigue(rep_velocities, up_best)
             up_goal = st.session_state.get("training_goal_select", "Strength")
             up_assess = assess_set_fatigue(rep_velocities, up_goal) if rep_velocities else None
-            if not demo_mode and (up_assess or up_fat):
+            if up_assess or up_fat:
                 fatigue_snapshot = _build_fatigue_snapshot(up_assess, up_fat)
                 if _should_refresh(last_fatigue_render_ts, FATIGUE_REFRESH_INTERVAL, now_ts) or fatigue_snapshot != last_fatigue_snapshot:
                     _render_fatigue_block(upload_fatigue_slot, up_assess, up_fat)
                     last_fatigue_snapshot = fatigue_snapshot
                     last_fatigue_render_ts = now_ts
 
-            if rep_velocities and (_should_refresh(last_chart_render_ts, chart_interval, now_ts) or (demo_mode and rep_changed)):
-                logger.info("[MODE_B_UPLOAD] build velocity fig")
+            if rep_velocities and _should_refresh(last_chart_render_ts, CHART_REFRESH_INTERVAL, now_ts):
                 if HAS_PLOTLY:
                     up_baseline = max(rep_velocities) if rep_velocities else 0
                     up_thresh = 0.20 if up_goal == "Strength" else (0.35 if up_goal == "Hypertrophy" else 0.15)
@@ -1534,17 +1395,16 @@ def _render_mode_b_upload() -> None:
                         template="plotly_dark",
                         height=320,
                         margin=dict(t=40, b=40),
-                        uirevision=make_chart_key("chart_mode_b_upload_velocity", "main"),
+                        uirevision="vbt_chart_ref_static",
                     )
-                    velocity_fig = fig
-                    velocity_line_chart_df = None
-                    should_render_velocity_chart = True
-                    if demo_mode:
-                        logger.info("[DEMO_CHART_REFRESH] rep=%s ts=%.3f", int(stats.get("reps", 0) or 0), now_ts)
+                    chart_container.plotly_chart(
+                        fig,
+                        width="stretch",
+                        theme="streamlit",
+                        key="vbt_chart_ref_static",
+                    )
                 else:
-                    velocity_fig = None
-                    velocity_line_chart_df = pd.DataFrame({"速度 (m/s)": rep_velocities}, index=range(1, len(rep_velocities) + 1))
-                    should_render_velocity_chart = True
+                    chart_container.line_chart(pd.DataFrame({"速度 (m/s)": rep_velocities}, index=range(1, len(rep_velocities) + 1)), width="stretch")
                 last_chart_render_ts = now_ts
                 last_chart_rep_count = len(rep_velocities)
                 chart_update_count += 1
@@ -1560,31 +1420,17 @@ def _render_mode_b_upload() -> None:
                     "loop_ms": (time.time() - loop_start_ts) * 1000.0,
                 }
                 if debug_info != last_debug_snapshot:
-                    if not demo_mode:
-                        _render_debug_block(debug_slot, debug_info)
+                    _render_debug_block(debug_slot, debug_info)
                     last_debug_snapshot = debug_info
-                if demo_mode and _should_refresh(last_demo_heartbeat_ts, 1.0, now_ts):
-                    logger.info(
-                        "[DEMO_HEARTBEAT] frame=%s rep=%s fps=%.1f loop_ms=%.1f video_refresh=%s metrics_refresh=%s chart_refresh=%s",
-                        stats.get("frame_id", "na"),
-                        int(stats.get("reps", 0) or 0),
-                        _safe_float(stats.get("fps"), 0.0),
-                        debug_info["loop_ms"],
-                        video_update_count,
-                        metric_update_count,
-                        chart_update_count,
-                    )
-                    last_demo_heartbeat_ts = now_ts
-                elif not demo_mode:
-                    logger.info(
-                        "local-video-debug video=%s metric=%s chart=%s history=%s rep_changed=%s loop_ms=%.1f",
-                        video_update_count,
-                        metric_update_count,
-                        chart_update_count,
-                        len(rep_velocities),
-                        rep_changed,
-                        debug_info["loop_ms"],
-                    )
+                logger.info(
+                    "local-video-debug video=%s metric=%s chart=%s history=%s rep_changed=%s loop_ms=%.1f",
+                    video_update_count,
+                    metric_update_count,
+                    chart_update_count,
+                    len(rep_velocities),
+                    rep_changed,
+                    debug_info["loop_ms"],
+                )
                 debug_window_start_ts = now_ts
                 video_update_count = 0
                 metric_update_count = 0
@@ -1608,18 +1454,6 @@ def _render_mode_b_upload() -> None:
 
     if last_frame_rgb is not None:
         video_container.image(_resize_frame_for_display(last_frame_rgb, video_display_width), channels="RGB")
-
-    if should_render_velocity_chart:
-        logger.info("[MODE_B_UPLOAD] render velocity chart once")
-        if velocity_fig is not None:
-            chart_container.plotly_chart(
-                velocity_fig,
-                width="stretch",
-                theme="streamlit",
-                key=make_chart_key("chart_mode_b_upload_velocity", "main"),
-            )
-        elif velocity_line_chart_df is not None:
-            chart_container.line_chart(velocity_line_chart_df, width="stretch")
 
     if final_stats is not None or rep_velocities:
         with summary_container.container():
@@ -1648,10 +1482,7 @@ def _render_mode_b_upload() -> None:
             st.info(f"🎉 第 {cur_set} 组分析完成！准备好第 {next_set} 组了吗？")
             if st.button(f"▶ 开始第 {next_set} 组", type="primary", key="next_set_btn"):
                 st.session_state["current_set_number"] = next_set
-                if demo_mode:
-                    st.info("演示模式下组号已更新，请重新点击开始分析。")
-                else:
-                    st.rerun()
+                st.rerun()
 
 
 def _render_session_review_tab(filter_user: str = "全部用户") -> None:
@@ -1765,7 +1596,7 @@ def _render_session_review_tab(filter_user: str = "全部用户") -> None:
             margin=dict(t=50, b=40),
             xaxis=dict(type="linear", dtick=1),
         )
-        st.plotly_chart(fig, width="stretch", key=make_chart_key("chart_review_session", "velocity"))
+        st.plotly_chart(fig, width="stretch", key="session_review_chart")
 
         v_first = y_vals[0]
         v_last = y_vals[-1]
@@ -2151,7 +1982,7 @@ def _render_legacy_tabs(user_name: str) -> None:
                     tickangle=-45,
                     title_text="训练节点 (日期 | 负重 | 组别 | 动作次序)",
                 )
-                st.plotly_chart(fig, width="stretch", key=make_chart_key("chart_history_fatigue", "loss"))
+                st.plotly_chart(fig, width="stretch", key="history_fatigue_chart")
             else:
                 st.dataframe(fatigue_df[["ts", "velocity_loss"]], width="stretch", hide_index=True)
 
@@ -2350,7 +2181,7 @@ def _render_legacy_tabs(user_name: str) -> None:
                                     height=380,
                                     font=dict(family="Noto Sans CJK SC, Microsoft YaHei, PingFang SC"),
                                 )
-                                st.plotly_chart(fig, width="stretch", key=make_chart_key("chart_history_1rm", "lvp"))
+                                st.plotly_chart(fig, width="stretch", key="history_1rm_chart")
 
                             # Task 2: VBT 智能训练规划器（仅当 LVP 有效时展示）
                             if one_rm is not None and 0 < one_rm <= 1000 and slope < 0:
@@ -2537,7 +2368,7 @@ def _render_ai_coach_section(user_name: str, load_kg: float) -> None:
                 height=380,
                 font=dict(family="Noto Sans CJK SC, Microsoft YaHei, PingFang SC"),
             )
-            st.plotly_chart(fig, width="stretch", key=make_chart_key("chart_profile_lvp", "velocity"))
+            st.plotly_chart(fig, width="stretch", key="lvp_chart")
 
             st.caption(
                 f"模型: V = {lvp.slope:.5f} × Load + {lvp.intercept:.4f}　|　"

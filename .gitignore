@@ -18,6 +18,11 @@ build/
 *.db
 squat_gym.db
 
+# 本地私有配置（使用 vbt_config.example.json 作为模板）
+vbt_config.json
+results/runtime_config.json
+results/realtime_rep_buffer_*.json
+
 # 视频与媒体（体积大、多为本地素材）
 videos/
 *.mov
